@@ -99,7 +99,7 @@ fn collect_files_from_stdin() -> Result<Vec<PathBuf>> {
 
 fn run_traverse(
     directory: &Path,
-    extensions: &Option<Vec<String>>,
+    extensions: Option<&Vec<String>>,
     max_depth: Option<usize>,
     roots_only: bool,
     json: bool,
@@ -221,7 +221,7 @@ fn run(args: &Args) -> Result<bool> {
             roots_only,
         }) => run_traverse(
             directory,
-            extensions,
+            extensions.as_ref(),
             *max_depth,
             *roots_only,
             args.json,
