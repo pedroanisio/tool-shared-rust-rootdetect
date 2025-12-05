@@ -1,0 +1,32 @@
+# Repository Metadata (ADR-140)
+# Canonical name: tool-shared-rust-rootdetect
+
+root: tool
+domain: shared
+type: rust
+name: rootdetect
+
+tech:
+  - rust
+  - cli
+
+owner: pedroanisio  # Set to GitHub username or team
+tier: 3      # Development/Lab, best-effort
+
+description: |
+  Detect project root directories from source file paths.
+  Finds project markers (.git, Cargo.toml, package.json, etc.) while
+  respecting exclusion zones (node_modules, .venv, target, etc.).
+
+keywords:
+  - project-root
+  - monorepo
+  - workspace
+  - developer-tools
+
+links:
+  spec: null  # Link to formal specification if published
+
+# ADR-140 enforcement metadata
+created: 2025-12-05
+graduated_from_lab: null  # Set if migrated from lab domain
