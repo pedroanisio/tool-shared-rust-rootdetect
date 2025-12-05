@@ -6,6 +6,8 @@ version: 0.1.0
 
 # Project Root Detector
 
+[![CI](https://github.com/pedroanisio/tool-shared-rust-rootdetect/actions/workflows/ci.yml/badge.svg)](https://github.com/pedroanisio/tool-shared-rust-rootdetect/actions/workflows/ci.yml)
+
 Detect project root directories from source file paths, supporting monorepos, virtual environments, and a wide range of project types.
 
 ## Features
@@ -87,9 +89,13 @@ use std::path::{Path, PathBuf};
 let config = Config::default();
 let source = Path::new("/home/user/my_project/src/main.rs");
 
-if let Some(root) = find_root(source, None::<&HashSet<PathBuf>>, &config) {
+// For single file lookup (without orphanage support)
+type StdHashSet = HashSet<PathBuf>;
+if let Some(root) = find_root(source, None::<&StdHashSet>, None::<&StdHashSet>, &config) {
     println!("Project root: {}", root.display());
 }
+
+// For batch processing with proper orphanage support, use find_roots_batch
 ```
 
 ### Batch Processing
@@ -153,7 +159,20 @@ The algorithm follows these cases in order:
 | 1 | File in exclusion zone | `None` (excluded) |
 | 2 | Marker directory found | Innermost marker directory |
 | 3 | Dependency cluster provided | LCA of the cluster |
-| 4 | Isolated orphan | Parent directory |
+| 4 | Orphan (no markers) | Outermost SourceDir in ancestry |
+
+### The Orphanage Rule
+
+For files without markers in their ancestry, the algorithm finds the **outermost** ancestor directory that contains source files. This groups related orphan files under a common root.
+
+```
+api-web2text/
+├── main.py              ← SourceDir: api-web2text/
+└── app/api/model/
+    └── user.py          → api-web2text/ (outermost SourceDir)
+```
+
+This requires batch processing via `find_roots_batch` or `traverse_and_detect` to compute SourceDirs upfront.
 
 ### Default Exclusions
 
