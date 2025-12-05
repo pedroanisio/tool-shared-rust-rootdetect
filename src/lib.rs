@@ -21,9 +21,13 @@
 //! let config = Config::default();
 //! let source = Path::new("/home/user/my_project/src/main.rs");
 //!
-//! if let Some(root) = find_root(source, None::<&HashSet<PathBuf>>, &config) {
+//! // For single file lookup (without orphanage support)
+//! type StdHashSet = HashSet<PathBuf>;
+//! if let Some(root) = find_root(source, None::<&StdHashSet>, None::<&StdHashSet>, &config) {
 //!     println!("Project root: {}", root.display());
 //! }
+//!
+//! // For batch processing with proper orphanage support, use find_roots_batch
 //! ```
 
 use std::collections::HashSet;
@@ -257,48 +261,45 @@ fn find_marker_root(source: &Path, config: &Config) -> Option<PathBuf> {
 
 /// Find the "orphanage" for an orphan file (no marker found).
 ///
-/// Walk up from the file until we hit:
-/// - A directory containing a marker → return the child (first orphan dir below it)
-/// - An exclusion boundary → return the child
-/// - Filesystem root → return the child of root (don't return "/" itself)
+/// Per spec: `orphanage(s) = min⊴(SourceDirs ∩ ancestors(s))`
 ///
-/// This groups related orphan files under a common ancestor instead of
-/// fragmenting them into separate parent directories.
-fn find_orphanage(source: &Path, config: &Config) -> PathBuf {
+/// This finds the **outermost** ancestor directory that contains source files.
+/// If no such directory exists in ancestry, falls back to the file's parent.
+///
+/// # Arguments
+///
+/// * `source` - The orphan source file
+/// * `source_dirs` - Pre-computed set of directories containing valid source files
+///
+/// # Returns
+///
+/// The outermost `SourceDir` in the file's ancestry, or `parent(source)` as fallback.
+fn find_orphanage<S: BuildHasher>(source: &Path, source_dirs: &HashSet<PathBuf, S>) -> PathBuf {
     let parent = source.parent().unwrap_or(source);
 
-    // Track previous directory as we walk up (becomes orphanage when we hit boundary)
-    let mut previous = parent.to_path_buf();
+    // Collect ancestors that are also SourceDirs
+    let mut ancestor_source_dirs: Vec<&Path> = Vec::new();
     let mut current = parent;
 
     loop {
-        let Some(ancestor) = current.parent() else {
-            // Hit filesystem root - return previous (child of root)
-            return previous;
-        };
-
-        if ancestor == current {
-            // Reached root (e.g., "/" or "C:\") - return previous
-            return previous;
+        // Check if this ancestor is a SourceDir
+        if source_dirs.contains(current) {
+            ancestor_source_dirs.push(current);
         }
 
-        // Check if ancestor is an exclusion boundary
-        if let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) {
-            if config.matches_exclusion(name) {
-                // Stop here - orphanage is current (child of exclusion)
-                return current.to_path_buf();
-            }
+        // Move to parent
+        match current.parent() {
+            Some(p) if p != current => current = p,
+            _ => break,
         }
+    }
 
-        // Check if ancestor has a marker (another project)
-        if config.marker_exists_in(ancestor) {
-            // Stop here - orphanage is current (child of marker dir)
-            return current.to_path_buf();
-        }
-
-        // Keep walking up, remember current as previous
-        previous = current.to_path_buf();
-        current = ancestor;
+    if ancestor_source_dirs.is_empty() {
+        // No SourceDirs in ancestry - fall back to parent (Case 5 scenario)
+        parent.to_path_buf()
+    } else {
+        // Return the outermost (last in our traversal, closest to root)
+        ancestor_source_dirs.last().unwrap().to_path_buf()
     }
 }
 
@@ -340,6 +341,9 @@ fn compute_lca<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf>
 /// # Arguments
 ///
 /// * `source_file` - Path to the source file
+/// * `source_dirs` - Optional set of directories containing valid source files.
+///   Required for correct orphanage behavior when no markers are found.
+///   If None, falls back to `parent(source_file)` for orphans.
 /// * `dependency_cluster` - Optional set of files in the same import cluster
 ///   (requires external static analysis to compute)
 /// * `config` - Configuration for exclusions and markers
@@ -354,21 +358,23 @@ fn compute_lca<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf>
 /// 1. If the file is in an exclusion zone → `None`
 /// 2. If a marker directory is found → innermost marker directory
 /// 3. If dependency cluster provided → LCA of the cluster
-/// 4. Otherwise → orphanage (topmost dir before hitting another project or root)
+/// 4. Otherwise → orphanage (outermost `SourceDir` in ancestry)
 #[must_use]
-pub fn find_root<S: BuildHasher>(
+pub fn find_root<S1: BuildHasher, S2: BuildHasher>(
     source_file: &Path,
-    dependency_cluster: Option<&HashSet<PathBuf, S>>,
+    source_dirs: Option<&HashSet<PathBuf, S1>>,
+    dependency_cluster: Option<&HashSet<PathBuf, S2>>,
     config: &Config,
 ) -> Option<PathBuf> {
-    find_root_with_cache(source_file, dependency_cluster, config, None)
+    find_root_with_cache(source_file, source_dirs, dependency_cluster, config, None)
 }
 
 /// Find the project root with an optional exclusion cache for better performance.
 #[must_use]
-pub fn find_root_with_cache<S: BuildHasher>(
+pub fn find_root_with_cache<S1: BuildHasher, S2: BuildHasher>(
     source_file: &Path,
-    dependency_cluster: Option<&HashSet<PathBuf, S>>,
+    source_dirs: Option<&HashSet<PathBuf, S1>>,
+    dependency_cluster: Option<&HashSet<PathBuf, S2>>,
     config: &Config,
     cache: Option<&ExclusionCache>,
 ) -> Option<PathBuf> {
@@ -397,29 +403,41 @@ pub fn find_root_with_cache<S: BuildHasher>(
         }
     }
 
-    // Case 4: Orphan - find the orphanage (topmost dir before another project)
-    Some(find_orphanage(source_file, config))
+    // Case 4: Orphan - find the orphanage (outermost SourceDir in ancestry)
+    source_dirs.map_or_else(
+        || Some(source_file.parent().unwrap_or(source_file).to_path_buf()),
+        |dirs| Some(find_orphanage(source_file, dirs)),
+    )
 }
 
 /// Batch process multiple source files efficiently using a shared cache.
+///
+/// This is the recommended API for processing multiple files, as it computes
+/// `SourceDirs` upfront to enable correct orphanage detection.
 #[must_use]
 pub fn find_roots_batch<'a>(
     source_files: impl IntoIterator<Item = &'a Path>,
     config: &Config,
 ) -> Vec<(&'a Path, Option<PathBuf>)> {
     let cache = ExclusionCache::new();
+    let files: Vec<&'a Path> = source_files.into_iter().collect();
 
-    source_files
+    // Compute SourceDirs: directories containing valid (non-excluded) source files
+    let source_dirs: HashSet<PathBuf> = files
+        .iter()
+        .filter(|f| !is_excluded(f, config, Some(&cache)))
+        .filter_map(|f| f.parent().map(Path::to_path_buf))
+        .collect();
+
+    files
         .into_iter()
         .map(|path| {
             (
                 path,
-                find_root_with_cache::<std::collections::hash_map::RandomState>(
-                    path,
-                    None,
-                    config,
-                    Some(&cache),
-                ),
+                find_root_with_cache::<
+                    std::collections::hash_map::RandomState,
+                    std::collections::hash_map::RandomState,
+                >(path, Some(&source_dirs), None, config, Some(&cache)),
             )
         })
         .collect()
@@ -475,6 +493,11 @@ impl TraversalOptions {
 /// zones (like `node_modules`, `.venv`, etc.), and returns the project root for each
 /// discovered source file.
 ///
+/// The function uses a two-phase approach:
+/// 1. First, collect all source files
+/// 2. Then, compute `SourceDirs` (directories containing source files)
+/// 3. Finally, detect roots with correct orphanage behavior
+///
 /// # Arguments
 ///
 /// * `start_path` - Directory to start traversal from
@@ -491,20 +514,37 @@ pub fn traverse_and_detect(
     options: &TraversalOptions,
 ) -> Vec<TraversalResult> {
     let cache = ExclusionCache::new();
-    let mut results = Vec::new();
 
-    traverse_recursive(start_path, config, options, &cache, 0, &mut results);
+    // Phase 1: Collect all source files
+    let mut files = Vec::new();
+    collect_files_recursive(start_path, config, options, 0, &mut files);
 
-    results
+    // Phase 2: Compute SourceDirs (directories containing valid source files)
+    let source_dirs: HashSet<PathBuf> = files
+        .iter()
+        .filter(|f| !is_excluded(f, config, Some(&cache)))
+        .filter_map(|f| f.parent().map(Path::to_path_buf))
+        .collect();
+
+    // Phase 3: Detect roots with proper orphanage support
+    files
+        .into_iter()
+        .map(|file| {
+            let root = find_root_with_cache::<
+                std::collections::hash_map::RandomState,
+                std::collections::hash_map::RandomState,
+            >(&file, Some(&source_dirs), None, config, Some(&cache));
+            TraversalResult { file, root }
+        })
+        .collect()
 }
 
-fn traverse_recursive(
+fn collect_files_recursive(
     dir: &Path,
     config: &Config,
     options: &TraversalOptions,
-    cache: &ExclusionCache,
     depth: usize,
-    results: &mut Vec<TraversalResult>,
+    files: &mut Vec<PathBuf>,
 ) {
     // Check max depth
     if let Some(max) = options.max_depth {
@@ -530,16 +570,10 @@ fn traverse_recursive(
 
         if path.is_dir() {
             // Recurse into subdirectory
-            traverse_recursive(&path, config, options, cache, depth + 1, results);
+            collect_files_recursive(&path, config, options, depth + 1, files);
         } else if path.is_file() && options.matches_extension(&path) {
-            // Found a source file - detect its root
-            let root = find_root_with_cache::<std::collections::hash_map::RandomState>(
-                &path,
-                None,
-                config,
-                Some(cache),
-            );
-            results.push(TraversalResult { file: path, root });
+            // Found a source file
+            files.push(path);
         }
     }
 }
@@ -562,6 +596,9 @@ mod tests {
     use super::*;
     use std::fs::{self, File};
     use tempfile::TempDir;
+
+    // Type alias for find_root with default hasher
+    type StdHashSet = HashSet<PathBuf>;
 
     fn setup_project(structure: &[(&str, bool)]) -> TempDir {
         let temp = TempDir::new().unwrap();
@@ -593,7 +630,7 @@ mod tests {
         let config = Config::default();
         let source = temp.path().join("src/main.rs");
 
-        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
+        let root = find_root(&source, None::<&StdHashSet>, None::<&StdHashSet>, &config);
         assert_eq!(root, Some(temp.path().to_path_buf()));
     }
 
@@ -609,7 +646,7 @@ mod tests {
         let config = Config::default();
         let source = temp.path().join("packages/api/src/index.ts");
 
-        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
+        let root = find_root(&source, None::<&StdHashSet>, None::<&StdHashSet>, &config);
         assert_eq!(root, Some(temp.path().join("packages/api")));
     }
 
@@ -625,7 +662,7 @@ mod tests {
             .path()
             .join(".venv/lib/python3.11/site-packages/flask/app.py");
 
-        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
+        let root = find_root(&source, None::<&StdHashSet>, None::<&StdHashSet>, &config);
         assert_eq!(root, None);
     }
 
@@ -642,14 +679,14 @@ mod tests {
         // File in node_modules should be excluded
         let excluded_source = temp.path().join("node_modules/lodash/index.js");
         assert_eq!(
-            find_root(&excluded_source, None::<&HashSet<PathBuf>>, &config),
+            find_root(&excluded_source, None::<&StdHashSet>, None::<&StdHashSet>, &config),
             None
         );
 
         // File in src should find the project root
         let valid_source = temp.path().join("src/app.js");
         assert_eq!(
-            find_root(&valid_source, None::<&HashSet<PathBuf>>, &config),
+            find_root(&valid_source, None::<&StdHashSet>, None::<&StdHashSet>, &config),
             Some(temp.path().to_path_buf())
         );
     }
@@ -657,18 +694,15 @@ mod tests {
     #[test]
     fn test_isolated_orphan_fallback() {
         // Single orphan file at temp/scripts/test.py
-        // No markers anywhere, orphanage walks all the way up
+        // Without source_dirs, falls back to parent directory
         let temp = setup_project(&[("scripts/test.py", false)]);
 
         let config = Config::default();
         let source = temp.path().join("scripts/test.py");
 
-        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
-        // Without markers, orphanage walks up to /tmp (child of root)
-        // This is correct behavior - groups all orphans under highest possible dir
-        assert!(root.is_some());
-        // The root should be an ancestor of the temp dir
-        assert!(temp.path().starts_with(root.as_ref().unwrap()));
+        // Without source_dirs, falls back to parent
+        let root = find_root(&source, None::<&StdHashSet>, None::<&StdHashSet>, &config);
+        assert_eq!(root, Some(temp.path().join("scripts")));
     }
 
     #[test]
@@ -682,7 +716,7 @@ mod tests {
         let config = Config::default();
         let source = temp.path().join("orphan-dir/deep/file.py");
 
-        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
+        let root = find_root(&source, None::<&StdHashSet>, None::<&StdHashSet>, &config);
         // File finds .git marker at temp root, returns temp root (Case 2)
         assert_eq!(root, Some(temp.path().to_path_buf()));
     }
@@ -699,7 +733,7 @@ mod tests {
         let config = Config::default();
         let source = temp.path().join("subdir/orphan/deep/file.py");
 
-        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
+        let root = find_root(&source, None::<&StdHashSet>, None::<&StdHashSet>, &config);
         // Should return temp/ because .git marker is found there (Case 2)
         assert_eq!(root, Some(temp.path().to_path_buf()));
     }
@@ -718,42 +752,81 @@ mod tests {
 
         // File with no inner marker gets the outermost marker (root)
         let orphan = temp.path().join("libs/orphan-pkg/src/main.py");
-        let orphan_root = find_root(&orphan, None::<&HashSet<PathBuf>>, &config);
+        let orphan_root = find_root(&orphan, None::<&StdHashSet>, None::<&StdHashSet>, &config);
         assert_eq!(orphan_root, Some(temp.path().to_path_buf()));
 
         // Real project file gets real-pkg as root (innermost marker)
         let real = temp.path().join("libs/real-pkg/src/index.js");
-        let real_root = find_root(&real, None::<&HashSet<PathBuf>>, &config);
+        let real_root = find_root(&real, None::<&StdHashSet>, None::<&StdHashSet>, &config);
         assert_eq!(real_root, Some(temp.path().join("libs/real-pkg")));
     }
 
     #[test]
-    fn test_orphanage_no_markers_groups_files() {
-        // TRUE orphanage test: NO markers anywhere
-        // All files should share the same orphanage
+    fn test_orphanage_with_source_dirs() {
+        // TRUE orphanage test using find_roots_batch which computes source_dirs
+        // Per spec: orphanage(s) = min⊴(SourceDirs ∩ ancestors(s))
         let temp = setup_project(&[
-            ("project/app/main.py", false),
-            ("project/app/utils/helper.py", false),
-            ("project/lib/core.py", false),
+            ("project/main.py", false),            // SourceDir: project/
+            ("project/app/utils/helper.py", false), // SourceDir: project/app/utils/
+            ("project/lib/core.py", false),         // SourceDir: project/lib/
         ]);
 
         let config = Config::default();
 
-        let file1 = temp.path().join("project/app/main.py");
-        let file2 = temp.path().join("project/app/utils/helper.py");
-        let file3 = temp.path().join("project/lib/core.py");
+        let files = vec![
+            temp.path().join("project/main.py"),
+            temp.path().join("project/app/utils/helper.py"),
+            temp.path().join("project/lib/core.py"),
+        ];
 
-        let root1 = find_root(&file1, None::<&HashSet<PathBuf>>, &config);
-        let root2 = find_root(&file2, None::<&HashSet<PathBuf>>, &config);
-        let root3 = find_root(&file3, None::<&HashSet<PathBuf>>, &config);
+        let results = find_roots_batch(files.iter().map(PathBuf::as_path), &config);
 
-        // All files should share the same orphanage
-        // (walks up until hitting filesystem boundary)
-        assert_eq!(root1, root2);
-        assert_eq!(root2, root3);
-        // The orphanage should be an ancestor of the files
-        assert!(root1.is_some());
-        assert!(temp.path().starts_with(root1.as_ref().unwrap()));
+        // All files should share the same orphanage: project/ (outermost SourceDir)
+        let roots: Vec<_> = results.iter().map(|(_, r)| r.clone()).collect();
+        assert_eq!(roots[0], Some(temp.path().join("project")));
+        assert_eq!(roots[1], Some(temp.path().join("project")));
+        assert_eq!(roots[2], Some(temp.path().join("project")));
+    }
+
+    #[test]
+    fn test_orphanage_deep_file_finds_outermost() {
+        // Test the spec example: api-web2text/app/api/model/user.py
+        // with main.py at api-web2text/, should return api-web2text/
+        let temp = setup_project(&[
+            ("api-web2text/main.py", false),              // SourceDir: api-web2text/
+            ("api-web2text/app/api/model/user.py", false), // deep file
+        ]);
+
+        let config = Config::default();
+
+        let files = vec![
+            temp.path().join("api-web2text/main.py"),
+            temp.path().join("api-web2text/app/api/model/user.py"),
+        ];
+
+        let results = find_roots_batch(files.iter().map(PathBuf::as_path), &config);
+
+        // Both files should get api-web2text/ as root (outermost SourceDir)
+        let roots: Vec<_> = results.iter().map(|(_, r)| r.clone()).collect();
+        assert_eq!(roots[0], Some(temp.path().join("api-web2text")));
+        assert_eq!(roots[1], Some(temp.path().join("api-web2text")));
+    }
+
+    #[test]
+    fn test_orphanage_isolated_file() {
+        // Single orphan file with no sources above it
+        // Falls back to parent directory per spec
+        let temp = setup_project(&[("scripts/test.py", false)]);
+
+        let config = Config::default();
+
+        let files = vec![temp.path().join("scripts/test.py")];
+
+        let results = find_roots_batch(files.iter().map(PathBuf::as_path), &config);
+
+        // SourceDirs = {scripts/}, ancestors ∩ SourceDirs = {scripts/}
+        // Outermost = scripts/
+        assert_eq!(results[0].1, Some(temp.path().join("scripts")));
     }
 
     #[test]
@@ -775,7 +848,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let root = find_root(&source, Some(&cluster), &config);
+        let root = find_root(&source, None::<&StdHashSet>, Some(&cluster), &config);
         assert_eq!(root, Some(temp.path().join("scripts")));
     }
 
@@ -791,7 +864,10 @@ mod tests {
 
         // The package.json inside node_modules should not be found
         let source = temp.path().join("node_modules/some-pkg/index.js");
-        assert_eq!(find_root(&source, None::<&HashSet<PathBuf>>, &config), None);
+        assert_eq!(
+            find_root(&source, None::<&StdHashSet>, None::<&StdHashSet>, &config),
+            None
+        );
     }
 
     #[test]
@@ -806,7 +882,7 @@ mod tests {
         let source = temp.path().join("src/main.cc");
 
         // Should find src/ because BUILD is there (innermost)
-        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
+        let root = find_root(&source, None::<&StdHashSet>, None::<&StdHashSet>, &config);
         assert_eq!(root, Some(temp.path().join("src")));
     }
 
