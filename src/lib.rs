@@ -384,6 +384,138 @@ pub fn find_roots_batch<'a>(
         .collect()
 }
 
+/// Result of traversing a directory and detecting roots for discovered files
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraversalResult {
+    /// The source file that was discovered
+    pub file: PathBuf,
+    /// The detected project root (None if excluded)
+    pub root: Option<PathBuf>,
+}
+
+/// Options for filesystem traversal
+#[derive(Debug, Clone, Default)]
+pub struct TraversalOptions {
+    /// File extensions to consider as source files (e.g., ["rs", "py", "js"])
+    /// If empty, all files are considered
+    pub extensions: HashSet<String>,
+    /// Maximum directory depth to traverse (None for unlimited)
+    pub max_depth: Option<usize>,
+}
+
+impl TraversalOptions {
+    /// Create options with specific file extensions
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: &[&str]) -> Self {
+        self.extensions = extensions.iter().copied().map(String::from).collect();
+        self
+    }
+
+    /// Set maximum traversal depth
+    #[must_use]
+    pub const fn with_max_depth(mut self, depth: usize) -> Self {
+        self.max_depth = Some(depth);
+        self
+    }
+
+    fn matches_extension(&self, path: &Path) -> bool {
+        if self.extensions.is_empty() {
+            return true;
+        }
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| self.extensions.contains(e))
+    }
+}
+
+/// Traverse a directory tree, discover source files, and detect their project roots.
+///
+/// This function walks the filesystem starting from `start_path`, skipping exclusion
+/// zones (like `node_modules`, `.venv`, etc.), and returns the project root for each
+/// discovered source file.
+///
+/// # Arguments
+///
+/// * `start_path` - Directory to start traversal from
+/// * `config` - Configuration for exclusions and markers
+/// * `options` - Traversal options (extensions filter, max depth)
+///
+/// # Returns
+///
+/// Vector of `TraversalResult` containing each discovered file and its root
+#[must_use]
+pub fn traverse_and_detect(
+    start_path: &Path,
+    config: &Config,
+    options: &TraversalOptions,
+) -> Vec<TraversalResult> {
+    let cache = ExclusionCache::new();
+    let mut results = Vec::new();
+
+    traverse_recursive(start_path, config, options, &cache, 0, &mut results);
+
+    results
+}
+
+fn traverse_recursive(
+    dir: &Path,
+    config: &Config,
+    options: &TraversalOptions,
+    cache: &ExclusionCache,
+    depth: usize,
+    results: &mut Vec<TraversalResult>,
+) {
+    // Check max depth
+    if let Some(max) = options.max_depth {
+        if depth > max {
+            return;
+        }
+    }
+
+    // Check if this directory is an exclusion boundary
+    if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+        if config.matches_exclusion(name) {
+            return; // Don't descend into exclusion zones
+        }
+    }
+
+    // Read directory entries
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // Skip unreadable directories
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            // Recurse into subdirectory
+            traverse_recursive(&path, config, options, cache, depth + 1, results);
+        } else if path.is_file() && options.matches_extension(&path) {
+            // Found a source file - detect its root
+            let root = find_root_with_cache::<std::collections::hash_map::RandomState>(
+                &path,
+                None,
+                config,
+                Some(cache),
+            );
+            results.push(TraversalResult { file: path, root });
+        }
+    }
+}
+
+/// Traverse and return only the unique project roots discovered
+#[must_use]
+pub fn discover_roots(
+    start_path: &Path,
+    config: &Config,
+    options: &TraversalOptions,
+) -> HashSet<PathBuf> {
+    traverse_and_detect(start_path, config, options)
+        .into_iter()
+        .filter_map(|r| r.root)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +724,212 @@ mod tests {
 
         // Verify cache is working
         cache.clear();
+    }
+
+    // ==================== TRAVERSAL TESTS ====================
+
+    #[test]
+    fn test_traverse_simple_project() {
+        let temp = setup_project(&[
+            (".git", true),
+            ("src/main.rs", false),
+            ("src/lib.rs", false),
+            ("Cargo.toml", false),
+        ]);
+
+        let config = Config::default();
+        let options = TraversalOptions::default().with_extensions(&["rs"]);
+
+        let results = traverse_and_detect(temp.path(), &config, &options);
+
+        // Should find 2 .rs files
+        assert_eq!(results.len(), 2);
+
+        // All should have the same root
+        for result in &results {
+            assert_eq!(result.root, Some(temp.path().to_path_buf()));
+        }
+    }
+
+    #[test]
+    fn test_traverse_skips_exclusion_zones() {
+        let temp = setup_project(&[
+            (".git", true),
+            ("src/main.rs", false),
+            ("node_modules/lodash/index.js", false),
+            ("node_modules/lodash/package.json", false),
+            (".venv/lib/site-packages/flask/app.py", false),
+        ]);
+
+        let config = Config::default();
+        let options = TraversalOptions::default(); // All files
+
+        let results = traverse_and_detect(temp.path(), &config, &options);
+
+        // Should only find files outside exclusion zones
+        let files: Vec<_> = results.iter().map(|r| &r.file).collect();
+
+        // Should NOT contain any node_modules or .venv files
+        for file in &files {
+            let path_str = file.to_string_lossy();
+            assert!(
+                !path_str.contains("node_modules"),
+                "Should not traverse node_modules: {path_str}"
+            );
+            assert!(
+                !path_str.contains(".venv"),
+                "Should not traverse .venv: {path_str}"
+            );
+        }
+
+        // Should find src/main.rs
+        assert!(files.iter().any(|f| f.ends_with("main.rs")));
+    }
+
+    #[test]
+    fn test_traverse_monorepo() {
+        let temp = setup_project(&[
+            (".git", true),
+            ("package.json", false),
+            ("packages/api/package.json", false),
+            ("packages/api/src/index.ts", false),
+            ("packages/web/package.json", false),
+            ("packages/web/src/app.tsx", false),
+        ]);
+
+        let config = Config::default();
+        let options = TraversalOptions::default().with_extensions(&["ts", "tsx"]);
+
+        let results = traverse_and_detect(temp.path(), &config, &options);
+
+        assert_eq!(results.len(), 2);
+
+        // api/src/index.ts should have root packages/api
+        let api_result = results
+            .iter()
+            .find(|r| r.file.ends_with("index.ts"))
+            .unwrap();
+        assert_eq!(api_result.root, Some(temp.path().join("packages/api")));
+
+        // web/src/app.tsx should have root packages/web
+        let web_result = results
+            .iter()
+            .find(|r| r.file.ends_with("app.tsx"))
+            .unwrap();
+        assert_eq!(web_result.root, Some(temp.path().join("packages/web")));
+    }
+
+    #[test]
+    fn test_traverse_with_max_depth() {
+        let temp = setup_project(&[
+            (".git", true),
+            ("a.rs", false),
+            ("src/b.rs", false),
+            ("src/nested/c.rs", false),
+            ("src/nested/deep/d.rs", false),
+        ]);
+
+        let config = Config::default();
+
+        // Depth 0 = only start directory
+        let options = TraversalOptions::default()
+            .with_extensions(&["rs"])
+            .with_max_depth(0);
+        let results = traverse_and_detect(temp.path(), &config, &options);
+        assert_eq!(results.len(), 1); // Only a.rs
+
+        // Depth 1 = start + one level
+        let options = TraversalOptions::default()
+            .with_extensions(&["rs"])
+            .with_max_depth(1);
+        let results = traverse_and_detect(temp.path(), &config, &options);
+        assert_eq!(results.len(), 2); // a.rs + src/b.rs
+
+        // Depth 2
+        let options = TraversalOptions::default()
+            .with_extensions(&["rs"])
+            .with_max_depth(2);
+        let results = traverse_and_detect(temp.path(), &config, &options);
+        assert_eq!(results.len(), 3); // a.rs + src/b.rs + src/nested/c.rs
+    }
+
+    #[test]
+    fn test_traverse_extension_filter() {
+        let temp = setup_project(&[
+            (".git", true),
+            ("main.rs", false),
+            ("lib.py", false),
+            ("app.js", false),
+            ("README.md", false),
+        ]);
+
+        let config = Config::default();
+
+        // Only .rs files
+        let options = TraversalOptions::default().with_extensions(&["rs"]);
+        let results = traverse_and_detect(temp.path(), &config, &options);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].file.ends_with("main.rs"));
+
+        // Multiple extensions
+        let options = TraversalOptions::default().with_extensions(&["rs", "py"]);
+        let results = traverse_and_detect(temp.path(), &config, &options);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_discover_roots_unique() {
+        let temp = setup_project(&[
+            (".git", true),
+            ("src/a.rs", false),
+            ("src/b.rs", false),
+            ("src/c.rs", false),
+        ]);
+
+        let config = Config::default();
+        let options = TraversalOptions::default().with_extensions(&["rs"]);
+
+        let roots = discover_roots(temp.path(), &config, &options);
+
+        // Should return only one unique root
+        assert_eq!(roots.len(), 1);
+        assert!(roots.contains(&temp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn test_traverse_nested_exclusions() {
+        let temp = setup_project(&[
+            (".git", true),
+            ("src/main.rs", false),
+            (".venv/lib/python/site-packages/pkg/module.py", false),
+            ("build/output/generated.rs", false),
+            ("target/debug/deps/crate.rs", false),
+        ]);
+
+        let config = Config::default();
+        let options = TraversalOptions::default();
+
+        let results = traverse_and_detect(temp.path(), &config, &options);
+
+        // Should only find src/main.rs (others are in exclusion zones)
+        assert_eq!(results.len(), 1);
+        assert!(results[0].file.ends_with("main.rs"));
+    }
+
+    #[test]
+    fn test_traverse_orphan_files() {
+        let temp = setup_project(&[("scripts/util.py", false), ("scripts/helper.py", false)]);
+
+        let config = Config::default();
+        let options = TraversalOptions::default().with_extensions(&["py"]);
+
+        let results = traverse_and_detect(temp.path(), &config, &options);
+
+        assert_eq!(results.len(), 2);
+
+        // Orphan files should fall back to parent directory
+        for result in &results {
+            assert_eq!(result.root, Some(temp.path().join("scripts")));
+        }
     }
 }

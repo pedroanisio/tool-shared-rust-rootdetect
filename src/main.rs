@@ -1,15 +1,20 @@
 //! CLI tool for detecting project roots
 //!
 //! Usage:
-//!   project-root-detector <file>...
-//!   project-root-detector --batch < files.txt
+//!   project-root-detector /path/to/dir          # Traverse directory
+//!   project-root-detector --files file1 file2   # Explicit file paths
+//!   project-root-detector --batch < files.txt   # Read paths from stdin
 
 use anyhow::{Context, Result};
-use clap::Parser;
-use project_root_detector::{find_roots_batch, Config};
+use clap::{Parser, Subcommand};
+use project_root_detector::{
+    discover_roots, find_roots_batch, traverse_and_detect, Config, TraversalOptions,
+    TraversalResult,
+};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::io::{self, BufRead};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Detect project root directories from source file paths.
@@ -17,21 +22,49 @@ use std::process::ExitCode;
 #[command(name = "project-root-detector")]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Read file paths from stdin (one per line)
-    #[arg(long)]
-    batch: bool,
-
-    /// Exit with code 1 if any file is excluded
-    #[arg(long)]
-    check: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
 
     /// Output results as JSON
-    #[arg(long)]
+    #[arg(long, global = true)]
     json: bool,
 
-    /// Source files to analyze
-    #[arg(value_name = "FILE")]
-    files: Vec<PathBuf>,
+    /// Exit with code 1 if any file is excluded
+    #[arg(long, global = true)]
+    check: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Traverse a directory tree and detect project roots for all source files
+    Traverse {
+        /// Directory to traverse
+        #[arg(value_name = "DIR")]
+        directory: PathBuf,
+
+        /// File extensions to include (e.g., rs, py, js). If not specified, all files are included.
+        #[arg(short, long, value_delimiter = ',')]
+        extensions: Option<Vec<String>>,
+
+        /// Maximum traversal depth (0 = only the start directory)
+        #[arg(short = 'd', long)]
+        max_depth: Option<usize>,
+
+        /// Only show unique project roots (not individual files)
+        #[arg(long)]
+        roots_only: bool,
+    },
+
+    /// Detect roots for explicit file paths
+    Files {
+        /// Source files to analyze
+        #[arg(value_name = "FILE")]
+        files: Vec<PathBuf>,
+
+        /// Read file paths from stdin (one per line)
+        #[arg(long)]
+        batch: bool,
+    },
 }
 
 /// Result for a single file's root detection
@@ -44,28 +77,97 @@ struct FileResult {
     excluded: bool,
 }
 
-fn collect_files(args: &Args) -> Result<Vec<PathBuf>> {
-    if args.batch || args.files.is_empty() {
-        let stdin = io::stdin();
-        let files: Vec<PathBuf> = stdin
-            .lock()
-            .lines()
-            .map(|line| line.context("Failed to read line from stdin"))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|line| !line.trim().is_empty())
-            .map(PathBuf::from)
-            .collect();
-        Ok(files)
+/// Result for unique roots discovery
+#[derive(Serialize)]
+struct RootsResult {
+    roots: Vec<PathBuf>,
+    count: usize,
+}
+
+fn collect_files_from_stdin() -> Result<Vec<PathBuf>> {
+    let stdin = io::stdin();
+    stdin
+        .lock()
+        .lines()
+        .map(|line| line.context("Failed to read line from stdin"))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| Ok(PathBuf::from(line)))
+        .collect()
+}
+
+fn run_traverse(
+    directory: &Path,
+    extensions: &Option<Vec<String>>,
+    max_depth: Option<usize>,
+    roots_only: bool,
+    json: bool,
+    check: bool,
+) -> Result<bool> {
+    let config = Config::default();
+
+    let mut options = TraversalOptions::default();
+    if let Some(exts) = extensions {
+        options.extensions = exts.iter().cloned().collect();
+    }
+    if let Some(depth) = max_depth {
+        options.max_depth = Some(depth);
+    }
+
+    if roots_only {
+        let roots: HashSet<PathBuf> = discover_roots(directory, &config, &options);
+        let mut roots_vec: Vec<PathBuf> = roots.into_iter().collect();
+        roots_vec.sort();
+
+        if json {
+            let result = RootsResult {
+                count: roots_vec.len(),
+                roots: roots_vec,
+            };
+            let json_str =
+                serde_json::to_string_pretty(&result).context("Failed to serialize to JSON")?;
+            println!("{json_str}");
+        } else {
+            for root in &roots_vec {
+                println!("{}", root.display());
+            }
+        }
+
+        Ok(false) // roots_only mode doesn't track exclusions
     } else {
-        Ok(args.files.clone())
+        let results: Vec<TraversalResult> = traverse_and_detect(directory, &config, &options);
+
+        let mut any_excluded = false;
+        let file_results: Vec<FileResult> = results
+            .into_iter()
+            .map(|r| {
+                let excluded = r.root.is_none();
+                if excluded {
+                    any_excluded = true;
+                }
+                FileResult {
+                    file: r.file,
+                    root: r.root,
+                    excluded,
+                }
+            })
+            .collect();
+
+        output_file_results(&file_results, json)?;
+
+        Ok(check && any_excluded)
     }
 }
 
-fn run(args: &Args) -> Result<bool> {
+fn run_files(files: &[PathBuf], batch: bool, json: bool, check: bool) -> Result<bool> {
     let config = Config::default();
 
-    let files = collect_files(args)?;
+    let files: Vec<PathBuf> = if batch || files.is_empty() {
+        collect_files_from_stdin()?
+    } else {
+        files.to_vec()
+    };
 
     if files.is_empty() {
         anyhow::bail!("No files provided");
@@ -74,7 +176,6 @@ fn run(args: &Args) -> Result<bool> {
     let results = find_roots_batch(files.iter().map(PathBuf::as_path), &config);
 
     let mut any_excluded = false;
-
     let file_results: Vec<FileResult> = results
         .into_iter()
         .map(|(path, root)| {
@@ -90,29 +191,63 @@ fn run(args: &Args) -> Result<bool> {
         })
         .collect();
 
-    if args.json {
-        let json = serde_json::to_string_pretty(&file_results)
-            .context("Failed to serialize results to JSON")?;
-        println!("{json}");
+    output_file_results(&file_results, json)?;
+
+    Ok(check && any_excluded)
+}
+
+fn output_file_results(results: &[FileResult], json: bool) -> Result<()> {
+    if json {
+        let json_str =
+            serde_json::to_string_pretty(results).context("Failed to serialize to JSON")?;
+        println!("{json_str}");
     } else {
-        for result in file_results {
-            match result.root {
-                Some(r) => println!("{} -> {}", result.file.display(), r.display()),
-                None => println!("{} -> (excluded)", result.file.display()),
-            }
+        for result in results {
+            result.root.as_ref().map_or_else(
+                || println!("{} -> (excluded)", result.file.display()),
+                |r| println!("{} -> {}", result.file.display(), r.display()),
+            );
         }
     }
+    Ok(())
+}
 
-    Ok(any_excluded)
+fn run(args: &Args) -> Result<bool> {
+    match &args.command {
+        Some(Command::Traverse {
+            directory,
+            extensions,
+            max_depth,
+            roots_only,
+        }) => run_traverse(
+            directory,
+            extensions,
+            *max_depth,
+            *roots_only,
+            args.json,
+            args.check,
+        ),
+
+        Some(Command::Files { files, batch }) => run_files(files, *batch, args.json, args.check),
+
+        // Default: if a single path is provided and it's a directory, traverse it
+        // Otherwise, treat arguments as files (backwards compatibility)
+        None => {
+            // No subcommand - show help
+            anyhow::bail!(
+                "No command specified. Use 'traverse <DIR>' or 'files <FILE>...'\n\
+                 Run with --help for more information."
+            )
+        }
+    }
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let check = args.check;
 
     match run(&args) {
-        Ok(any_excluded) => {
-            if check && any_excluded {
+        Ok(should_fail) => {
+            if should_fail {
                 ExitCode::from(1)
             } else {
                 ExitCode::SUCCESS
@@ -152,6 +287,18 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("excluded"));
         assert!(!json.contains(r#""root""#)); // None should be skipped
+    }
+
+    #[test]
+    fn test_roots_result_serialization() {
+        let result = RootsResult {
+            roots: vec![PathBuf::from("/project1"), PathBuf::from("/project2")],
+            count: 2,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("roots"));
+        assert!(json.contains("count"));
+        assert!(json.contains("/project1"));
     }
 
     #[test]
