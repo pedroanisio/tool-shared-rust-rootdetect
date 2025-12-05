@@ -54,9 +54,11 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    env:
+      # Override rust-toolchain.toml - cargo-audit requires Rust 1.85+
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
-      # Use stable toolchain for audit (cargo-audit requires newer Rust than MSRV)
       - uses: dtolnay/rust-toolchain@stable
       - uses: rustsec/audit-check@v2
         with:
