@@ -1,0 +1,244 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  # First, validate the release
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      prerelease: ${{ steps.version.outputs.PRERELEASE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          
+          # Check if prerelease
+          if [[ "$VERSION" =~ (alpha|beta|rc) ]]; then
+            echo "PRERELEASE=true" >> $GITHUB_OUTPUT
+          else
+            echo "PRERELEASE=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG_VERSION="${{ steps.version.outputs.VERSION }}"
+          
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "❌ Version mismatch!"
+            echo "   Cargo.toml: $CARGO_VERSION"
+            echo "   Git tag:    $TAG_VERSION"
+            exit 1
+          fi
+          echo "✅ Version match: $CARGO_VERSION"
+
+  # Run tests before building release
+  test:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --all-features --locked
+
+      - name: Run clippy
+        run: cargo clippy --all-features --locked -- -D warnings
+
+  # Build for multiple platforms
+  build:
+    needs: [validate, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: linux-x64
+            
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: linux-arm64
+            cross: true
+            
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: darwin-x64
+            
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: darwin-arm64
+            
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-x64
+            ext: .exe
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Cross-compilation for ARM Linux
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      # Get binary name from Cargo.toml
+      - name: Get binary name
+        id: bin
+        shell: bash
+        run: |
+          NAME=$(grep '^\[\[bin\]\]' -A5 Cargo.toml | grep '^name' | head -1 | sed 's/.*"\(.*\)".*/\1/' || grep '^name' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "NAME=$NAME" >> $GITHUB_OUTPUT
+
+      # Package the binary
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          strip ${{ steps.bin.outputs.NAME }}${{ matrix.ext }} || true
+          tar czvf ../../../${{ steps.bin.outputs.NAME }}-${{ needs.validate.outputs.version }}-${{ matrix.name }}.tar.gz \
+            ${{ steps.bin.outputs.NAME }}${{ matrix.ext }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path "${{ steps.bin.outputs.NAME }}${{ matrix.ext }}" `
+            -DestinationPath "../../../${{ steps.bin.outputs.NAME }}-${{ needs.validate.outputs.version }}-${{ matrix.name }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  # Create GitHub Release
+  release:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for changelog
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          
+          if [ -n "$PREV_TAG" ]; then
+            echo "Generating changelog from $PREV_TAG to ${{ github.ref_name }}"
+            
+            {
+              echo "## What's Changed"
+              echo ""
+              
+              # Features
+              FEATS=$(git log ${PREV_TAG}..${{ github.ref_name }} --pretty=format:"- %s (%h)" --grep="^feat" || true)
+              if [ -n "$FEATS" ]; then
+                echo "### 🚀 Features"
+                echo "$FEATS"
+                echo ""
+              fi
+              
+              # Fixes
+              FIXES=$(git log ${PREV_TAG}..${{ github.ref_name }} --pretty=format:"- %s (%h)" --grep="^fix" || true)
+              if [ -n "$FIXES" ]; then
+                echo "### 🐛 Bug Fixes"
+                echo "$FIXES"
+                echo ""
+              fi
+              
+              # Other
+              OTHERS=$(git log ${PREV_TAG}..${{ github.ref_name }} --pretty=format:"- %s (%h)" --grep="^feat" --grep="^fix" --invert-grep || true)
+              if [ -n "$OTHERS" ]; then
+                echo "### 📦 Other Changes"
+                echo "$OTHERS"
+                echo ""
+              fi
+              
+              echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${{ github.ref_name }}"
+            } > RELEASE_NOTES.md
+          else
+            echo "## 🎉 Initial Release" > RELEASE_NOTES.md
+          fi
+          
+          cat RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ needs.validate.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+          files: |
+            artifacts/*
+          fail_on_unmatched_files: true
+
+  # Optional: Publish to crates.io
+  publish-crates:
+    needs: [validate, release]
+    if: ${{ needs.validate.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -n "$CARGO_REGISTRY_TOKEN" ]; then
+            cargo publish --locked
+          else
+            echo "⚠️ CARGO_REGISTRY_TOKEN not set, skipping publish"
+          fi
