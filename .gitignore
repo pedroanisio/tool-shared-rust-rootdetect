@@ -3,7 +3,7 @@
 **/*.rs.bk
 
 # Cargo package manager files
-Cargo.lock
+# Note: Cargo.lock IS committed for binary crates (ADR-006/ADR-016)
 
 # IDE/editor settings
 .vscode/
