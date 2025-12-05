@@ -396,7 +396,7 @@ pub struct TraversalResult {
 /// Options for filesystem traversal
 #[derive(Debug, Clone, Default)]
 pub struct TraversalOptions {
-    /// File extensions to consider as source files (e.g., ["rs", "py", "js"])
+    /// File extensions to consider as source files (e.g., `rs`, `py`, `js`)
     /// If empty, all files are considered
     pub extensions: HashSet<String>,
     /// Maximum directory depth to traverse (None for unlimited)
