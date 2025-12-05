@@ -40,4 +40,5 @@ node_modules/
 *.bak
 
 # Ignore ADR tool output
-.vscode/sessions.json
+
+data/

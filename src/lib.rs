@@ -679,14 +679,24 @@ mod tests {
         // File in node_modules should be excluded
         let excluded_source = temp.path().join("node_modules/lodash/index.js");
         assert_eq!(
-            find_root(&excluded_source, None::<&StdHashSet>, None::<&StdHashSet>, &config),
+            find_root(
+                &excluded_source,
+                None::<&StdHashSet>,
+                None::<&StdHashSet>,
+                &config
+            ),
             None
         );
 
         // File in src should find the project root
         let valid_source = temp.path().join("src/app.js");
         assert_eq!(
-            find_root(&valid_source, None::<&StdHashSet>, None::<&StdHashSet>, &config),
+            find_root(
+                &valid_source,
+                None::<&StdHashSet>,
+                None::<&StdHashSet>,
+                &config
+            ),
             Some(temp.path().to_path_buf())
         );
     }
@@ -742,9 +752,9 @@ mod tests {
     fn test_nested_project_innermost_wins() {
         // Nested project markers - innermost wins (Case 2)
         let temp = setup_project(&[
-            (".git", true),                                  // Root project
-            ("libs/orphan-pkg/src/main.py", false),          // No marker - returns root
-            ("libs/real-pkg/package.json", false),           // Nested project marker
+            (".git", true),                         // Root project
+            ("libs/orphan-pkg/src/main.py", false), // No marker - returns root
+            ("libs/real-pkg/package.json", false),  // Nested project marker
             ("libs/real-pkg/src/index.js", false),
         ]);
 
@@ -766,7 +776,7 @@ mod tests {
         // TRUE orphanage test using find_roots_batch which computes source_dirs
         // Per spec: orphanage(s) = min⊴(SourceDirs ∩ ancestors(s))
         let temp = setup_project(&[
-            ("project/main.py", false),            // SourceDir: project/
+            ("project/main.py", false),             // SourceDir: project/
             ("project/app/utils/helper.py", false), // SourceDir: project/app/utils/
             ("project/lib/core.py", false),         // SourceDir: project/lib/
         ]);
@@ -793,7 +803,7 @@ mod tests {
         // Test the spec example: api-web2text/app/api/model/user.py
         // with main.py at api-web2text/, should return api-web2text/
         let temp = setup_project(&[
-            ("api-web2text/main.py", false),              // SourceDir: api-web2text/
+            ("api-web2text/main.py", false), // SourceDir: api-web2text/
             ("api-web2text/app/api/model/user.py", false), // deep file
         ]);
 

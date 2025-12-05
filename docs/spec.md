@@ -1,3 +1,25 @@
+---
+title: "Source Code Project Root Detection"
+subtitle: "Formal Specification"
+version: 1.0.1
+date: 2025-06-05
+status: Final
+authors:
+  - Human (Design & Requirements)
+  - Claude (Formalization & Implementation)
+abstract: |
+  A formal specification for detecting project root directories from source files.
+  Handles markers (.git, pyproject.toml, etc.), exclusion zones (node_modules, .venv),
+  and orphan grouping via the "orphanage rule." Designed for IDEs, build tools, and
+  static analyzers that need reliable project boundary detection.
+keywords:
+  - project detection
+  - source code analysis
+  - filesystem traversal
+  - monorepo
+license: CC-BY-4.0
+---
+
 # Formal Specification: Source Code Project Root Detection
 
 ## Preliminaries
@@ -29,7 +51,9 @@ Default values (configurable):
 
 $$\mathcal{E} = \{\texttt{.venv}, \texttt{venv}, \texttt{node\_modules}, \texttt{\_\_pycache\_\_}, \texttt{site-packages}, \texttt{.tox}, \texttt{dist}, \texttt{build}, \texttt{.egg-info}, \texttt{.mypy\_cache}, \texttt{.pytest\_cache}, \texttt{.ruff\_cache}, \texttt{target}, \texttt{vendor}, \texttt{.gradle}\}$$
 
-$$\mathcal{M} = \{\texttt{.git}, \texttt{.hg}, \texttt{pyproject.toml}, \texttt{setup.py}, \texttt{package.json}, \texttt{Cargo.toml}, \texttt{go.mod}, \texttt{pom.xml}, \texttt{build.gradle}, \texttt{CMakeLists.txt}, \texttt{deno.json}, \texttt{composer.json}, \texttt{mix.exs}\}$$
+$$\mathcal{M} = \{\texttt{.git}, \texttt{.hg}, \texttt{.svn}, \texttt{pyproject.toml}, \texttt{setup.py}, \texttt{package.json}, \texttt{Cargo.toml}, \texttt{go.mod}, \texttt{pom.xml}, \texttt{build.gradle}, \texttt{CMakeLists.txt}, \texttt{deno.json}, \texttt{composer.json}, \texttt{mix.exs}, \texttt{Gemfile}, \texttt{BUILD}, \texttt{WORKSPACE}\}$$
+
+*Note on markers:* `Makefile` is intentionally excluded from defaults—it commonly appears in subdirectories and would cause false root detection. Add it only if your codebase uses Makefiles exclusively at project roots.
 
 ---
 
@@ -80,6 +104,12 @@ The directories containing valid markers:
 
 $$\text{MarkerDirs} = \{\text{parent}(m) : m \in M\}$$
 
+### Source Directories
+
+The directories directly containing valid source files:
+
+$$\text{SourceDirs} = \{\text{parent}(s) : s \in S'\}$$
+
 ---
 
 ## 3. Ancestor Constraints
@@ -105,15 +135,54 @@ $$\forall s \in S',\ \forall d \in \text{Roots}(s) : \text{clear}(s, d)$$
 
 ---
 
-## 4. Dependency Closure
+## 4. Orphans and Orphanages
 
-For handling orphan files that import each other:
+Files without markers in their ancestry require special handling to avoid root fragmentation.
+
+### Definition (Orphan)
+
+A source file $s \in S'$ is an **orphan** iff no marker exists in its ancestry:
+
+$$\text{orphan}(s) \iff \text{Roots}(s) = \emptyset$$
+
+### Definition (Orphanage)
+
+The **orphanage** of an orphan source file $s$ is the **outermost ancestor directory that contains source files**:
+
+$$\text{orphanage}(s) = \min_{\trianglelefteq}(\text{SourceDirs} \cap \text{ancestors}(s))$$
+
+This is the topmost directory in $s$'s ancestry that directly contains at least one source file.
+
+*Notation:* $\min_{\trianglelefteq}$ means "minimum by the ancestor relation"—i.e., the **outermost** directory, closest to the filesystem root. Conversely, $\max_{\trianglelefteq}$ means the **innermost** directory, closest to the file.
+
+### The Orphanage Rule
+
+*"Source files mark their parent directory as a potential root. The outermost such directory becomes the orphanage."*
+
+| Scenario | Orphanage |
+|----------|-----------|
+| Source file exists at ancestor level | Outermost ancestor with source |
+| No source files above | $\text{parent}(s)$ (file's immediate parent) |
+
+### Lemma 3 (Orphanage Grouping)
+
+All orphan files sharing a common ancestor with source files get the same orphanage:
+
+If $\text{orphan}(s_1) \land \text{orphan}(s_2) \land \exists a \in \text{SourceDirs} : a \trianglelefteq s_1 \land a \trianglelefteq s_2$, then $\text{orphanage}(s_1) = \text{orphanage}(s_2)$.
+
+*Proof:* Both files compute the minimum over $\text{SourceDirs} \cap \text{ancestors}(s)$, and they share the relevant ancestors.
+
+---
+
+## 5. Dependency Closure
+
+For additional grouping of related orphan files:
 
 ### Definition (Dependency Relation)
 
 $D \subseteq S \times S$ where $(a, b) \in D$ means "file $a$ imports file $b$."
 
-*Note:* Construction of $D$ requires static analysis (parsing import statements) and is outside the scope of this specification. The closure is symmetric, so direction only matters for documentation.
+*Note:* Construction of $D$ requires static analysis (parsing import statements) and is outside the scope of this specification.
 
 ### Definition (Dependency Closure)
 
@@ -131,7 +200,7 @@ The LCA exists and is unique in a tree.
 
 ---
 
-## 5. Root Function
+## 6. Root Function
 
 ### Definition (Project Root)
 
@@ -141,28 +210,35 @@ $$\rho(s) = \begin{cases}
 \bot & \text{if } s \in \mathcal{X} \\[8pt]
 \max_{\trianglelefteq}(\text{Roots}(s)) & \text{if } \text{Roots}(s) \neq \emptyset \\[8pt]
 \text{LCA}(\text{closure}_D(s) \cap S') & \text{if } |\text{closure}_D(s) \cap S'| > 1 \\[8pt]
-\text{parent}(s) & \text{if } \text{parent}(s) \neq s \\[8pt]
+\text{orphanage}(s) & \text{if } \text{parent}(s) \neq s \\[8pt]
 s & \text{otherwise (file at filesystem root)}
 \end{cases}$$
 
 Where:
-- $\bot$ indicates "not a project file" (excluded)
-- Case 2: Innermost directory containing a project marker (closest to source file)
-- Case 3: Orphan cluster — use LCA of the dependency-connected component
-- Case 4: Isolated orphan — fall back to parent directory
-- Case 5: Edge case for files at filesystem root
+- **Case 1:** $\bot$ indicates "not a project file" (excluded)
+- **Case 2:** Innermost marker directory (marker takes precedence)
+- **Case 3:** Orphan cluster — use LCA of the dependency-connected component
+- **Case 4:** Orphan — use orphanage (outermost SourceDir in ancestry)
+- **Case 5:** Edge case for files directly at filesystem root
+
+*Implementation note:* Case 3 requires static import analysis to construct $D$, which may be expensive or unavailable. Implementations may skip directly from Case 2 to Case 4 when dependency information is not provided.
 
 ### Theorem (Well-Definedness)
 
 For all $s \in S'$: $\rho(s)$ is defined, $\rho(s) \neq \bot$, and $\rho(s) \trianglelefteq s$.
 
-*Proof sketch:* Case 2's maximum exists since $\text{Roots}(s) \subseteq \text{ancestors}(s)$ which is finite and totally ordered. Case 3's LCA exists by tree properties. Cases 4–5 are always defined. ∎
+*Proof sketch:* Case 2's maximum exists since $\text{Roots}(s) \subseteq \text{ancestors}(s)$ which is finite and totally ordered. Case 3's LCA exists by tree properties. Case 4's orphanage is well-defined: $\text{SourceDirs} \cap \text{ancestors}(s)$ is non-empty (contains at least $\text{parent}(s)$) and finite, so the minimum exists. Case 5 handles the degenerate case where $s$ is at filesystem root. ∎
+
+### Theorem (Marker Precedence)
+
+Markers always take precedence over orphanage computation:
+$$\text{Roots}(s) \neq \emptyset \implies \rho(s) \in \text{MarkerDirs}$$
+
+*Proof:* Case 2 has priority over Cases 3–4.
 
 ---
 
-## 6. Algorithm
-
-> **Note:** This implementation handles Cases 1, 2, and 4 of the specification. Case 3 (dependency closure) requires external static analysis infrastructure to construct relation $D$, which is passed as an optional parameter.
+## 7. Algorithm
 
 ```python
 from pathlib import Path
@@ -174,25 +250,20 @@ EXCLUSIONS = {
 }
 
 MARKERS = {
-    '.git', '.hg', 'pyproject.toml', 'setup.py', 'package.json',
+    '.git', '.hg', '.svn', 'pyproject.toml', 'setup.py', 'package.json',
     'Cargo.toml', 'go.mod', 'pom.xml', 'build.gradle', 'CMakeLists.txt',
-    'deno.json', 'composer.json', 'mix.exs'
+    'deno.json', 'composer.json', 'mix.exs', 'Gemfile', 'BUILD', 'WORKSPACE'
 }
 
-# Module-level cache for exclusion checks (cleared between runs if needed)
 _exclusion_cache: dict[Path, bool] = {}
+_marker_cache: dict[Path, bool] = {}
 
 
 def is_excluded(path: Path) -> bool:
-    """Check if resolved path passes through any exclusion boundary.
-    
-    Note: Case-sensitive matching. On case-insensitive filesystems,
-    consider normalizing names with .lower() before comparison.
-    """
+    """Check if resolved path passes through any exclusion boundary."""
     try:
         resolved = path.resolve()
     except OSError:
-        # Symlink cycle or other resolution failure — treat as excluded
         return True
     
     if resolved in _exclusion_cache:
@@ -203,187 +274,272 @@ def is_excluded(path: Path) -> bool:
     return result
 
 
-def find_root(source_file: Path, dependency_cluster: set[Path] | None = None) -> Path | None:
+def has_marker(directory: Path) -> bool:
+    """Check if directory contains any project marker.
+    
+    Permission errors are treated as marker-not-present.
     """
-    Compute project root for a source file.
+    if directory in _marker_cache:
+        return _marker_cache[directory]
     
-    Args:
-        source_file: Path to the source file
-        dependency_cluster: Optional set of files in the same import cluster
-                           (requires external static analysis to compute)
+    try:
+        result = any((directory / m).exists() for m in MARKERS)
+    except OSError:
+        result = False
     
-    Returns:
-        Project root directory, or None if file is excluded
+    _marker_cache[directory] = result
+    return result
+
+
+def _find_root_single(
+    source_file: Path,
+    source_dirs: set[Path],
+    dependency_cluster: set[Path] | None = None
+) -> Path | None:
+    """
+    Internal: Compute project root for a single source file.
+    
+    Use compute_all_roots() for batch processing with orphanage support.
     """
     # Case 1: Excluded file
     if is_excluded(source_file):
         return None
     
-    # Case 2: Search for marker directories (innermost first)
-    # source_file.parents is ordered from immediate parent outward
+    # Case 2: Walk up looking for markers (innermost wins)
     for ancestor in source_file.parents:
-        # Stop if we hit an exclusion boundary
         if ancestor.name in EXCLUSIONS:
             break
-        
-        # Check for project markers
-        for marker in MARKERS:
-            if (ancestor / marker).exists():
-                return ancestor  # First (innermost) match wins
+        if has_marker(ancestor):
+            return ancestor
+        if ancestor.parent == ancestor:
+            break
     
-    # Case 3: Orphan with dependency cluster
+    # Case 3: Check dependency cluster for LCA
     if dependency_cluster and len(dependency_cluster) > 1:
         valid_files = {f for f in dependency_cluster if not is_excluded(f)}
         if len(valid_files) > 1:
-            # Compute LCA of the cluster
             common = None
             for f in valid_files:
                 try:
                     resolved = f.resolve()
                 except OSError:
                     continue
-                # Note: Path.parents may not include immediate parent at index 0
-                # in all Python versions, so we include it explicitly for safety
                 parents = set(resolved.parents) | {resolved.parent}
                 common = parents if common is None else (common & parents)
             if common:
                 return max(common, key=lambda p: len(p.parts))
     
-    # Case 4/5: Isolated orphan (handle root edge case)
+    # Case 4: Orphan — find outermost SourceDir in ancestry
+    ancestor_source_dirs = [
+        d for d in source_file.parents
+        if d in source_dirs and d.name not in EXCLUSIONS
+    ]
+    if ancestor_source_dirs:
+        # min by ⊴ (outermost) = last in parents traversal
+        return ancestor_source_dirs[-1]
+    
+    # Case 5: Filesystem root edge case
     parent = source_file.parent
     return parent if parent != source_file else source_file
 
 
-# Complexity: O(d * |MARKERS|) per file, where d is directory depth.
-# The is_excluded cache amortizes repeated checks on shared ancestors.
+def compute_all_roots(
+    source_files: set[Path],
+    dependency_clusters: dict[Path, set[Path]] | None = None
+) -> dict[Path, Path | None]:
+    """
+    Compute roots for all source files.
+    
+    This is the primary API. It computes SourceDirs upfront to enable
+    the orphanage rule for proper grouping of unmarked files.
+    
+    Args:
+        source_files: Set of all source file paths
+        dependency_clusters: Optional mapping from file to its import cluster
+    
+    Returns:
+        Mapping from source file to its project root (or None if excluded)
+    """
+    # Filter excluded files
+    valid_files = {f for f in source_files if not is_excluded(f)}
+    
+    # Compute SourceDirs (enables orphanage detection)
+    source_dirs = {f.parent for f in valid_files}
+    
+    # Compute root for each file
+    results = {}
+    for f in source_files:
+        cluster = dependency_clusters.get(f) if dependency_clusters else None
+        results[f] = _find_root_single(f, source_dirs, cluster)
+    
+    return results
+
+
+# Complexity: O(n × d + d × |MARKERS|) with caching, where n = file count, d = max depth.
+# Without caching: O(n × d × |MARKERS|).
 ```
 
 ### Implementation Considerations
 
-1. **Symlink cycles:** Handled by try/except around `Path.resolve()`. Unresolvable paths are treated as excluded.
+1. **Primary API:** Use `compute_all_roots()` for correct orphanage behavior. The internal `_find_root_single()` requires `source_dirs` to be pre-computed.
 
-2. **Case sensitivity:** The exclusion check is case-sensitive. On Windows/macOS, consider:
-   ```python
-   EXCLUSIONS_LOWER = {e.lower() for e in EXCLUSIONS}
-   # Then check: part.lower() in EXCLUSIONS_LOWER
-   ```
+2. **Symlink cycles:** Handled by try/except around `Path.resolve()`.
 
-3. **Caching:** The module-level `_exclusion_cache` amortizes repeated exclusion checks. For root results, consider a similar cache keyed by resolved path.
+3. **Permission errors:** Treated as marker-not-present (fail open).
 
-4. **Marker configurability:** In practice, $\mathcal{M}$ and $\mathcal{E}$ should be configurable. Consider loading from a config file or environment.
+4. **Case sensitivity:** On Windows/macOS, consider normalizing with `.lower()`.
 
-5. **Cache invalidation:** For long-running processes, implement cache clearing when the filesystem changes (e.g., via file watchers).
+5. **Caching:** Both `is_excluded()` and `has_marker()` cache results. Clear caches for long-running processes when filesystem changes.
+
+6. **Configurability:** $\mathcal{M}$ and $\mathcal{E}$ should be configurable via config file or environment.
+
+7. **Platform paths:** This implementation assumes POSIX-style paths. Windows drive letters (e.g., `C:\`) and UNC paths (e.g., `\\server\share`) may require additional handling—see Non-Goals.
 
 ---
 
-## 7. Examples
+## 8. Examples
 
 | Scenario | Input | Output | Reason |
 |----------|-------|--------|--------|
-| Standard project | `my_project/src/main.py` | `my_project/` | Found `.git` marker |
-| Monorepo package | `mono/packages/app/index.ts` | `mono/packages/app/` | Found `package.json` (innermost) |
-| Virtual env file | `.venv/lib/python3.11/flask/app.py` | $\bot$ | Path contains `.venv` |
-| Orphan cluster | `~/scripts/a.py` imports `b.py` | `~/scripts/` | LCA of cluster |
-| Isolated script | `~/scratch/test.py` | `~/scratch/` | Parent fallback |
-| Symlink escape | `.venv/site-packages/pkg` → `../../src/pkg` | `my_project/` | Resolved path is not excluded |
+| File in marked dir | `project/src/main.py` (`.git` at `project/`) | `project/` | Case 2: marker |
+| Nested markers | `mono/pkg/app/index.ts` (both have `package.json`) | `mono/pkg/app/` | Case 2: innermost |
+| Orphan with root source | `api/app/model/user.py` (`main.py` at `api/`) | `api/` | Case 4: orphanage |
+| Deep orphan | `api/a/b/c/file.py` (`main.py` at `api/`) | `api/` | Case 4: same orphanage |
+| Isolated orphan | `/tmp/scripts/test.py` (no other sources) | `scripts/` | Case 4: parent fallback |
+| Hidden project | `api/lib/hidden/.git` + `api/lib/hidden/src/app.py` | `hidden/` | Case 2: marker wins |
+| Excluded | `.venv/lib/flask/app.py` | $\bot$ | Case 1 |
 
 ---
 
-## 8. Worked Example
+## 9. Worked Examples
 
-Step-by-step trace for a monorepo file:
+### Example 1: Orphanage Detection
 
 ```
-Input: source_file = /home/user/mono/packages/api/src/index.ts
-
 Filesystem:
-/home/user/mono/
-├── .git
-├── package.json
-└── packages/
-    ├── api/
-    │   ├── package.json    ← innermost marker
-    │   └── src/
-    │       └── index.ts    ← source file
-    └── web/
-        └── ...
+api-web2text/              ← main.py here (SourceDir)
+├── main.py
+├── app/
+│   └── api/
+│       └── model/
+│           └── user.py    ← query file
+└── services/
+    └── auth.py
+
+SourceDirs = {api-web2text/, model/, services/}
 ```
 
-**Step 1: Check exclusion**
+**Trace for `user.py`:**
 ```
-resolved = /home/user/mono/packages/api/src/index.ts
-parts = ('/', 'home', 'user', 'mono', 'packages', 'api', 'src', 'index.ts')
-EXCLUSIONS ∩ parts = ∅
-→ Not excluded, continue to Case 2
+1. is_excluded? No
+2. Walk up for markers:
+   - model/        → no marker
+   - api/          → no marker
+   - app/          → no marker
+   - api-web2text/ → no marker
+   → No markers found, proceed to Case 4
+
+3. Find outermost SourceDir in ancestry:
+   - Ancestors: model/, api/, app/, api-web2text/, ...
+   - Ancestors ∩ SourceDirs = {model/, api-web2text/}
+   - Outermost (min ⊴) = api-web2text/
+
+Result: api-web2text/
 ```
 
-**Step 2: Search ancestors for markers (innermost first)**
-```
-/home/user/mono/packages/api/src    — no markers, continue
-/home/user/mono/packages/api        — contains package.json ✓ STOP
-```
-
-**Result:** `/home/user/mono/packages/api`
-
-Note that `/home/user/mono/` also contains markers (`.git`, `package.json`), but we return the innermost match. This correctly identifies the `api` package as the project root rather than the monorepo root.
+All files (`main.py`, `user.py`, `auth.py`) share root `api-web2text/`.
 
 ---
 
-## 9. Edge Cases
-
-### Symlinks Escaping Exclusion Zones
-
-Editable installs create symlinks from `site-packages` into source directories:
+### Example 2: Marker Takes Precedence
 
 ```
-project/
-├── .git
-├── src/
-│   └── mylib/
-└── .venv/
-    └── site-packages/
-        └── mylib → ../../../src/mylib  (symlink)
+Filesystem:
+api-web2text/
+├── main.py
+├── app/
+│   └── model/
+│       └── user.py
+└── lib/
+    └── hidden-project/
+        ├── .git           ← MARKER
+        └── src/
+            └── app.py     ← query file
 ```
 
-The path `.venv/site-packages/mylib/core.py` resolves to `project/src/mylib/core.py`, which is **not** excluded. The algorithm correctly returns `project/` as the root.
-
-### Nested Exclusion Zones
-
+**Trace for `app.py`:**
 ```
-project/
-├── .git
-├── src/
-└── .venv/
-    └── lib/
-        └── node_modules/    ← nested exclusion
-            └── ...
+1. is_excluded? No
+2. Walk up for markers:
+   - src/            → no marker
+   - hidden-project/ → HAS .git → RETURN hidden-project/
+
+Result: hidden-project/
 ```
 
-Both `.venv` and `node_modules` trigger exclusion. The algorithm stops at the first boundary encountered.
+The marker at `hidden-project/` wins. Case 2 takes precedence.
 
-### Markers Inside Exclusion Zones
+---
 
-```
-project/
-├── .git
-└── node_modules/
-    └── some-package/
-        └── package.json    ← ignored marker
-```
-
-The `package.json` inside `node_modules` is not in $M$ and won't be considered as a project root marker.
-
-### Co-located Dependency Cluster
-
-When all files in a dependency cluster reside in the same directory:
+### Example 3: Isolated Script
 
 ```
-~/scripts/
-├── a.py    (imports b)
-└── b.py
+Filesystem:
+/tmp/
+└── scratch/
+    └── test.py    ← only source file
+
+SourceDirs = {scratch/}
 ```
 
-Both Case 3 (LCA) and Case 4 (parent fallback) produce `~/scripts/`. The algorithm handles this gracefully—co-located orphans don't need special treatment.
+**Trace for `test.py`:**
+```
+1. is_excluded? No
+2. Walk up for markers: none found
+3. No dependency cluster
+4. Ancestors ∩ SourceDirs = {scratch/}
+   Outermost = scratch/
+
+Result: scratch/
+```
+
+---
+
+### Example 4: Nested Orphanages
+
+```
+Filesystem:
+~/code/
+├── project-a/
+│   ├── .git         ← marker
+│   └── src/
+│       └── main.py
+└── orphan-stuff/    ← no marker
+    ├── utils.py     ← SourceDir = orphan-stuff/
+    └── app/
+        └── file.py
+
+SourceDirs = {src/, orphan-stuff/, app/}
+```
+
+**Trace for `file.py` (in orphan-stuff/app/):**
+```
+1. is_excluded? No
+2. Walk up for markers:
+   - app/          → no marker
+   - orphan-stuff/ → no marker
+   - ~/code/       → no marker
+   → No markers found
+
+3. Find outermost SourceDir in ancestry:
+   - Ancestors: app/, orphan-stuff/, ~/code/, ...
+   - Ancestors ∩ SourceDirs = {app/, orphan-stuff/}
+   - Outermost = orphan-stuff/
+
+Result: orphan-stuff/
+```
+
+Note: `project-a/` has a marker but is not in `file.py`'s ancestry, so it doesn't affect the result.
 
 ---
 
@@ -391,20 +547,25 @@ Both Case 3 (LCA) and Case 4 (parent fallback) produce `~/scripts/`. The algorit
 
 ### Theorem (Stability)
 
-Adding files outside exclusion zones does not change existing roots, provided dependency relationships are unchanged:
-$$s \in S' \land S' \subseteq S'' \land (S'' \setminus S') \cap \mathcal{X} = \emptyset \land D_{S'} = D_{S''} \implies \rho_{S'}(s) = \rho_{S''}(s)$$
+Adding files outside exclusion zones does not change roots determined by markers:
+$$\text{Roots}(s) \neq \emptyset \implies \rho(s) \text{ is independent of } S$$
 
-*Caveat:* Without the constraint $D_{S'} = D_{S''}$, an isolated orphan (Case 4) may transition to Case 3 if new files create dependency connections, potentially changing its root.
+*Note:* Orphanage roots may change as $\text{SourceDirs}$ changes with new files.
 
 ### Theorem (Exclusion Monotonicity)
 
 Expanding the exclusion set can only exclude more files:
 $$\mathcal{E} \subseteq \mathcal{E}' \implies \mathcal{X} \subseteq \mathcal{X}'$$
 
-### Theorem (Innermost Marker Wins)
+### Theorem (Marker Precedence)
 
-For files with clear paths to multiple markers, the closest one determines the root:
-$$|\text{Roots}(s)| > 1 \implies \rho(s) = \max_{\trianglelefteq}(\text{Roots}(s))$$
+Markers always override orphanage computation:
+$$\text{Roots}(s) \neq \emptyset \implies \rho(s) = \max_{\trianglelefteq}(\text{Roots}(s))$$
+
+### Theorem (Orphanage Grouping)
+
+Orphan files under the same outermost SourceDir share a root:
+$$\text{orphan}(s_1) \land \text{orphan}(s_2) \land \text{orphanage}(s_1) = \text{orphanage}(s_2) \implies \rho(s_1) = \rho(s_2)$$
 
 ---
 
@@ -412,7 +573,7 @@ $$|\text{Roots}(s)| > 1 \implies \rho(s) = \max_{\trianglelefteq}(\text{Roots}(s
 
 This specification explicitly does not address:
 
-1. **Language/framework detection** — Determining *which* language or build system a project uses is a separate concern. This spec only finds the root directory.
+1. **Language/framework detection** — Determining *which* language or build system a project uses is a separate concern.
 
 2. **Workspace/solution files** — IDE project files (`.sln`, `.xcworkspace`) that span multiple roots require higher-level orchestration.
 
@@ -420,7 +581,9 @@ This specification explicitly does not address:
 
 4. **Build graph construction** — While we use dependency relation $D$ for orphan handling, constructing $D$ via static analysis is external to this spec.
 
-5. **Remote/distributed filesystems** — The algorithm assumes local filesystem semantics. Network filesystem quirks (e.g., different symlink behavior) may require adaptation.
+5. **Remote/distributed filesystems** — The algorithm assumes local filesystem semantics.
+
+6. **Windows-specific path handling** — Drive letters (`C:\`), UNC paths (`\\server\share`), and junction points may require platform-specific adaptation. The algorithm's logic is portable, but path parsing details vary by OS.
 
 ---
 
@@ -429,10 +592,14 @@ This specification explicitly does not address:
 This specification provides a robust algorithm for project root detection that:
 
 1. **Excludes artifacts** — Virtual environments, `node_modules`, build outputs, and caches are never treated as project sources
-2. **Respects boundaries** — Traversal stops at exclusion boundaries, preventing incorrect root assignment
+
+2. **Respects markers** — Directories with `.git`, `pyproject.toml`, etc. are recognized as project roots (innermost wins)
+
 3. **Handles symlinks** — Resolution before exclusion checking allows editable installs to work correctly
-4. **Supports orphans** — Files without markers get reasonable fallback behavior based on dependencies or parent directory
-5. **Prefers innermost roots** — Monorepos with nested projects resolve to the most specific applicable root
+
+4. **Groups orphans** — Files without markers share the outermost directory containing source files as their root (orphanage rule)
+
+5. **Maintains precedence** — Markers always take precedence over orphanage computation
 
 ---
 
@@ -440,16 +607,26 @@ This specification provides a robust algorithm for project root detection that:
 
 ### Case Priority
 
-| Case | Condition | Result |
-|------|-----------|--------|
-| 1 | $s \in \mathcal{X}$ | $\bot$ (excluded) |
-| 2 | $\text{Roots}(s) \neq \emptyset$ | Innermost marker directory |
-| 3 | $|\text{closure}_D(s) \cap S'| > 1$ | LCA of dependency cluster |
-| 4 | $\text{parent}(s) \neq s$ | Parent directory |
-| 5 | Otherwise | $s$ itself (filesystem root edge case) |
+| Priority | Case | Condition | Result |
+|----------|------|-----------|--------|
+| 1 | Excluded | $s \in \mathcal{X}$ | $\bot$ |
+| 2 | Marked | $\text{Roots}(s) \neq \emptyset$ | Innermost marker directory |
+| 3 | Cluster | $|\text{closure}_D(s) \cap S'| > 1$ | LCA of dependency cluster |
+| 4 | Orphan | $\text{parent}(s) \neq s$ | Outermost SourceDir in ancestry |
+| 5 | Root | Otherwise | $s$ (file at filesystem root) |
+
+### The Orphanage Rule
+
+*"Source files mark their parent as a root candidate. For orphans, the outermost such directory wins."*
+
+$$\text{orphanage}(s) = \min_{\trianglelefteq}(\text{SourceDirs} \cap \text{ancestors}(s))$$
+
+*Notation:* $\min_{\trianglelefteq}$ = outermost (closest to root); $\max_{\trianglelefteq}$ = innermost (closest to file).
 
 ### Default Sets
 
 **Exclusions** ($\mathcal{E}$): `.venv`, `venv`, `node_modules`, `__pycache__`, `site-packages`, `.tox`, `dist`, `build`, `.egg-info`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `target`, `vendor`, `.gradle`
 
-**Markers** ($\mathcal{M}$): `.git`, `.hg`, `pyproject.toml`, `setup.py`, `package.json`, `Cargo.toml`, `go.mod`, `pom.xml`, `build.gradle`, `CMakeLists.txt`, `deno.json`, `composer.json`, `mix.exs`
+**Markers** ($\mathcal{M}$): `.git`, `.hg`, `.svn`, `pyproject.toml`, `setup.py`, `package.json`, `Cargo.toml`, `go.mod`, `pom.xml`, `build.gradle`, `CMakeLists.txt`, `deno.json`, `composer.json`, `mix.exs`, `Gemfile`, `BUILD`, `WORKSPACE`
+
+*Note:* `Makefile` excluded by default—commonly appears in subdirectories.
