@@ -262,8 +262,8 @@ fn find_marker_root(source: &Path, config: &Config) -> Option<PathBuf> {
 /// Find the "orphanage" for an orphan file (no marker found).
 ///
 /// The sibling-aware orphanage rule:
-/// "Walk up until we find a level with no sibling SourceDirs AND the parent itself
-/// is not a SourceDir, then return that level."
+/// "Walk up until we find a level with no sibling `SourceDirs` AND the parent itself
+/// is not a `SourceDir`, then return that level."
 ///
 /// This groups related files under a common parent when:
 /// 1. Multiple sibling branches contain source files, OR
@@ -343,7 +343,7 @@ fn find_orphanage<S: BuildHasher>(source: &Path, source_dirs: &HashSet<PathBuf, 
     }
 }
 
-/// Check if a path is a SourceDir or has an ancestor that is a SourceDir.
+/// Check if a path is a `SourceDir` or has an ancestor that is a `SourceDir`.
 fn is_or_has_ancestor_source_dir<S: BuildHasher>(
     path: &Path,
     source_dirs: &HashSet<PathBuf, S>,
@@ -360,7 +360,7 @@ fn is_or_has_ancestor_source_dir<S: BuildHasher>(
     }
 }
 
-/// Check if a directory has sibling directories that are or contain SourceDirs.
+/// Check if a directory has sibling directories that are or contain `SourceDirs`.
 fn has_sibling_source_dirs<S: BuildHasher>(
     current: &Path,
     parent: &Path,
@@ -385,7 +385,7 @@ fn has_sibling_source_dirs<S: BuildHasher>(
         }
 
         // Check if any SourceDir is under this sibling
-        for sd in source_dirs.iter() {
+        for sd in source_dirs {
             if sd.starts_with(&sibling) {
                 return true;
             }
