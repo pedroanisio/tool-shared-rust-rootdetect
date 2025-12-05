@@ -255,6 +255,53 @@ fn find_marker_root(source: &Path, config: &Config) -> Option<PathBuf> {
     None
 }
 
+/// Find the "orphanage" for an orphan file (no marker found).
+///
+/// Walk up from the file until we hit:
+/// - A directory containing a marker → return the child (first orphan dir below it)
+/// - An exclusion boundary → return the child
+/// - Filesystem root → return the child of root (don't return "/" itself)
+///
+/// This groups related orphan files under a common ancestor instead of
+/// fragmenting them into separate parent directories.
+fn find_orphanage(source: &Path, config: &Config) -> PathBuf {
+    let parent = source.parent().unwrap_or(source);
+
+    // Track previous directory as we walk up (becomes orphanage when we hit boundary)
+    let mut previous = parent.to_path_buf();
+    let mut current = parent;
+
+    loop {
+        let Some(ancestor) = current.parent() else {
+            // Hit filesystem root - return previous (child of root)
+            return previous;
+        };
+
+        if ancestor == current {
+            // Reached root (e.g., "/" or "C:\") - return previous
+            return previous;
+        }
+
+        // Check if ancestor is an exclusion boundary
+        if let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) {
+            if config.matches_exclusion(name) {
+                // Stop here - orphanage is current (child of exclusion)
+                return current.to_path_buf();
+            }
+        }
+
+        // Check if ancestor has a marker (another project)
+        if config.marker_exists_in(ancestor) {
+            // Stop here - orphanage is current (child of marker dir)
+            return current.to_path_buf();
+        }
+
+        // Keep walking up, remember current as previous
+        previous = current.to_path_buf();
+        current = ancestor;
+    }
+}
+
 /// Compute the Lowest Common Ancestor of a set of paths
 fn compute_lca<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf> {
     let mut common_ancestors: Option<HashSet<PathBuf>> = None;
@@ -307,7 +354,7 @@ fn compute_lca<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf>
 /// 1. If the file is in an exclusion zone → `None`
 /// 2. If a marker directory is found → innermost marker directory
 /// 3. If dependency cluster provided → LCA of the cluster
-/// 4. Otherwise → parent directory (isolated orphan)
+/// 4. Otherwise → orphanage (topmost dir before hitting another project or root)
 #[must_use]
 pub fn find_root<S: BuildHasher>(
     source_file: &Path,
@@ -350,14 +397,8 @@ pub fn find_root_with_cache<S: BuildHasher>(
         }
     }
 
-    // Case 4/5: Isolated orphan - fall back to parent directory
-    let parent = source_file.parent()?;
-    if parent == source_file {
-        // Edge case: file at filesystem root
-        Some(source_file.to_path_buf())
-    } else {
-        Some(parent.to_path_buf())
-    }
+    // Case 4: Orphan - find the orphanage (topmost dir before another project)
+    Some(find_orphanage(source_file, config))
 }
 
 /// Batch process multiple source files efficiently using a shared cache.
@@ -615,13 +656,104 @@ mod tests {
 
     #[test]
     fn test_isolated_orphan_fallback() {
+        // Single orphan file at temp/scripts/test.py
+        // No markers anywhere, orphanage walks all the way up
         let temp = setup_project(&[("scripts/test.py", false)]);
 
         let config = Config::default();
         let source = temp.path().join("scripts/test.py");
 
         let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
-        assert_eq!(root, Some(temp.path().join("scripts")));
+        // Without markers, orphanage walks up to /tmp (child of root)
+        // This is correct behavior - groups all orphans under highest possible dir
+        assert!(root.is_some());
+        // The root should be an ancestor of the temp dir
+        assert!(temp.path().starts_with(root.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn test_orphanage_bounded_by_marker() {
+        // When a marker exists above, orphanage stops below it
+        let temp = setup_project(&[
+            (".git", true), // Marker at root
+            ("orphan-dir/deep/file.py", false),
+        ]);
+
+        let config = Config::default();
+        let source = temp.path().join("orphan-dir/deep/file.py");
+
+        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
+        // File finds .git marker at temp root, returns temp root (Case 2)
+        assert_eq!(root, Some(temp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn test_file_below_project_returns_project_root() {
+        // Files below a project with markers return the project root (Case 2)
+        // NOT the orphanage - this is correct behavior
+        let temp = setup_project(&[
+            (".git", true),                        // Root has marker
+            ("subdir/orphan/deep/file.py", false), // No markers in subdir tree
+        ]);
+
+        let config = Config::default();
+        let source = temp.path().join("subdir/orphan/deep/file.py");
+
+        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
+        // Should return temp/ because .git marker is found there (Case 2)
+        assert_eq!(root, Some(temp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn test_nested_project_innermost_wins() {
+        // Nested project markers - innermost wins (Case 2)
+        let temp = setup_project(&[
+            (".git", true),                                  // Root project
+            ("libs/orphan-pkg/src/main.py", false),          // No marker - returns root
+            ("libs/real-pkg/package.json", false),           // Nested project marker
+            ("libs/real-pkg/src/index.js", false),
+        ]);
+
+        let config = Config::default();
+
+        // File with no inner marker gets the outermost marker (root)
+        let orphan = temp.path().join("libs/orphan-pkg/src/main.py");
+        let orphan_root = find_root(&orphan, None::<&HashSet<PathBuf>>, &config);
+        assert_eq!(orphan_root, Some(temp.path().to_path_buf()));
+
+        // Real project file gets real-pkg as root (innermost marker)
+        let real = temp.path().join("libs/real-pkg/src/index.js");
+        let real_root = find_root(&real, None::<&HashSet<PathBuf>>, &config);
+        assert_eq!(real_root, Some(temp.path().join("libs/real-pkg")));
+    }
+
+    #[test]
+    fn test_orphanage_no_markers_groups_files() {
+        // TRUE orphanage test: NO markers anywhere
+        // All files should share the same orphanage
+        let temp = setup_project(&[
+            ("project/app/main.py", false),
+            ("project/app/utils/helper.py", false),
+            ("project/lib/core.py", false),
+        ]);
+
+        let config = Config::default();
+
+        let file1 = temp.path().join("project/app/main.py");
+        let file2 = temp.path().join("project/app/utils/helper.py");
+        let file3 = temp.path().join("project/lib/core.py");
+
+        let root1 = find_root(&file1, None::<&HashSet<PathBuf>>, &config);
+        let root2 = find_root(&file2, None::<&HashSet<PathBuf>>, &config);
+        let root3 = find_root(&file3, None::<&HashSet<PathBuf>>, &config);
+
+        // All files should share the same orphanage
+        // (walks up until hitting filesystem boundary)
+        assert_eq!(root1, root2);
+        assert_eq!(root2, root3);
+        // The orphanage should be an ancestor of the files
+        assert!(root1.is_some());
+        assert!(temp.path().starts_with(root1.as_ref().unwrap()));
     }
 
     #[test]
@@ -927,9 +1059,11 @@ mod tests {
 
         assert_eq!(results.len(), 2);
 
-        // Orphan files should fall back to parent directory
+        // Orphan files should share the same orphanage
+        let first_root = results[0].root.clone();
+        assert!(first_root.is_some());
         for result in &results {
-            assert_eq!(result.root, Some(temp.path().join("scripts")));
+            assert_eq!(result.root, first_root);
         }
     }
 }
