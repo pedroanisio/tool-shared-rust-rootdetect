@@ -7,6 +7,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Override rust-toolchain.toml for release builds (use latest stable)
+  RUSTUP_TOOLCHAIN: stable
 
 permissions:
   contents: write
@@ -26,7 +28,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          
+
           # Check if prerelease
           if [[ "$VERSION" =~ (alpha|beta|rc) ]]; then
             echo "PRERELEASE=true" >> $GITHUB_OUTPUT
@@ -38,7 +40,7 @@ jobs:
         run: |
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           TAG_VERSION="${{ steps.version.outputs.VERSION }}"
-          
+
           if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
             echo "❌ Version mismatch!"
             echo "   Cargo.toml: $CARGO_VERSION"
@@ -72,20 +74,15 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: linux-x64
-            
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: linux-arm64
-            cross: true
-            
+
           - target: x86_64-apple-darwin
             os: macos-latest
             name: darwin-x64
-            
+
           - target: aarch64-apple-darwin
             os: macos-latest
             name: darwin-arm64
-            
+
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: windows-x64
@@ -101,18 +98,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Cross-compilation for ARM Linux
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
 
       # Get binary name from Cargo.toml
       - name: Get binary name
@@ -174,14 +161,14 @@ jobs:
         run: |
           # Get previous tag
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          
+
           if [ -n "$PREV_TAG" ]; then
             echo "Generating changelog from $PREV_TAG to ${{ github.ref_name }}"
-            
+
             {
               echo "## What's Changed"
               echo ""
-              
+
               # Features
               FEATS=$(git log ${PREV_TAG}..${{ github.ref_name }} --pretty=format:"- %s (%h)" --grep="^feat" || true)
               if [ -n "$FEATS" ]; then
@@ -189,7 +176,7 @@ jobs:
                 echo "$FEATS"
                 echo ""
               fi
-              
+
               # Fixes
               FIXES=$(git log ${PREV_TAG}..${{ github.ref_name }} --pretty=format:"- %s (%h)" --grep="^fix" || true)
               if [ -n "$FIXES" ]; then
@@ -197,7 +184,7 @@ jobs:
                 echo "$FIXES"
                 echo ""
               fi
-              
+
               # Other
               OTHERS=$(git log ${PREV_TAG}..${{ github.ref_name }} --pretty=format:"- %s (%h)" --grep="^feat" --grep="^fix" --invert-grep || true)
               if [ -n "$OTHERS" ]; then
@@ -205,13 +192,13 @@ jobs:
                 echo "$OTHERS"
                 echo ""
               fi
-              
+
               echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${{ github.ref_name }}"
             } > RELEASE_NOTES.md
           else
             echo "## 🎉 Initial Release" > RELEASE_NOTES.md
           fi
-          
+
           cat RELEASE_NOTES.md
 
       - name: Create GitHub Release
