@@ -62,16 +62,16 @@ fn collect_files(args: &Args) -> Result<Vec<PathBuf>> {
     }
 }
 
-fn run(args: Args) -> Result<bool> {
+fn run(args: &Args) -> Result<bool> {
     let config = Config::default();
 
-    let files = collect_files(&args)?;
+    let files = collect_files(args)?;
 
     if files.is_empty() {
         anyhow::bail!("No files provided");
     }
 
-    let results = find_roots_batch(files.iter().map(|p| p.as_path()), &config);
+    let results = find_roots_batch(files.iter().map(PathBuf::as_path), &config);
 
     let mut any_excluded = false;
 
@@ -110,7 +110,7 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let check = args.check;
 
-    match run(args) {
+    match run(&args) {
         Ok(any_excluded) => {
             if check && any_excluded {
                 ExitCode::from(1)

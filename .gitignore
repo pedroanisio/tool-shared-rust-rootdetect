@@ -1,1 +1,43 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo package manager files
+Cargo.lock
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.code-workspace
+
+# Temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Test, coverage, and debug output
+/coverage/
+*.profraw
+*.profdata
+
+# Byproducts of 'cargo test'
+/*.log
+
+# Ignore local configuration and secrets
+.claude/settings.local.json
+
+# Python virtual environments (if any)
+.venv/
+venv/
+
+# Node.js dependencies (if any)
+node_modules/
+
+# Miscellaneous
+*.tmp
+*.bak
+
+# Ignore ADR tool output
 .vscode/sessions.json

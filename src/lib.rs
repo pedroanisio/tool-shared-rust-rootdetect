@@ -15,17 +15,19 @@
 //!
 //! ```no_run
 //! use project_root_detector::{find_root, Config};
-//! use std::path::Path;
+//! use std::collections::HashSet;
+//! use std::path::{Path, PathBuf};
 //!
 //! let config = Config::default();
 //! let source = Path::new("/home/user/my_project/src/main.rs");
 //!
-//! if let Some(root) = find_root(source, None, &config) {
+//! if let Some(root) = find_root(source, None::<&HashSet<PathBuf>>, &config) {
 //!     println!("Project root: {}", root.display());
 //! }
 //! ```
 
 use std::collections::HashSet;
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use thiserror::Error;
@@ -69,9 +71,11 @@ pub const DEFAULT_MARKERS: &[&str] = &[
 /// Errors that can occur during root detection
 #[derive(Error, Debug)]
 pub enum RootDetectionError {
+    /// Failed to resolve or canonicalize a path
     #[error("failed to resolve path: {0}")]
     ResolutionFailed(#[from] std::io::Error),
 
+    /// The path has no parent directory (e.g., filesystem root)
     #[error("path has no parent directory")]
     NoParent,
 }
@@ -90,8 +94,12 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            exclusions: DEFAULT_EXCLUSIONS.iter().map(|s| s.to_string()).collect(),
-            markers: DEFAULT_MARKERS.iter().map(|s| s.to_string()).collect(),
+            exclusions: DEFAULT_EXCLUSIONS
+                .iter()
+                .copied()
+                .map(String::from)
+                .collect(),
+            markers: DEFAULT_MARKERS.iter().copied().map(String::from).collect(),
             case_insensitive: cfg!(any(target_os = "windows", target_os = "macos")),
         }
     }
@@ -99,23 +107,28 @@ impl Default for Config {
 
 impl Config {
     /// Create a new config with custom exclusions and markers
+    #[must_use]
     pub fn new(exclusions: &[&str], markers: &[&str]) -> Self {
         Self {
-            exclusions: exclusions.iter().map(|s| s.to_string()).collect(),
-            markers: markers.iter().map(|s| s.to_string()).collect(),
+            exclusions: exclusions.iter().copied().map(String::from).collect(),
+            markers: markers.iter().copied().map(String::from).collect(),
             case_insensitive: cfg!(any(target_os = "windows", target_os = "macos")),
         }
     }
 
     /// Add additional exclusion patterns
+    #[must_use]
     pub fn with_exclusions(mut self, exclusions: &[&str]) -> Self {
-        self.exclusions.extend(exclusions.iter().map(|s| s.to_string()));
+        self.exclusions
+            .extend(exclusions.iter().copied().map(String::from));
         self
     }
 
     /// Add additional marker patterns
+    #[must_use]
     pub fn with_markers(mut self, markers: &[&str]) -> Self {
-        self.markers.extend(markers.iter().map(|s| s.to_string()));
+        self.markers
+            .extend(markers.iter().copied().map(String::from));
         self
     }
 
@@ -128,13 +141,27 @@ impl Config {
         }
     }
 
-    fn matches_marker(&self, name: &str) -> bool {
-        if self.case_insensitive {
-            let lower = name.to_lowercase();
-            self.markers.iter().any(|m| m.to_lowercase() == lower)
-        } else {
-            self.markers.contains(name)
+    fn marker_exists_in(&self, dir: &Path) -> bool {
+        for marker in &self.markers {
+            let marker_path = dir.join(marker);
+            if marker_path.exists() {
+                return true;
+            }
+            // Also check case-insensitive on Windows/macOS
+            if self.case_insensitive {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    let lower_marker = marker.to_lowercase();
+                    for entry in entries.flatten() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name.to_lowercase() == lower_marker {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
         }
+        false
     }
 }
 
@@ -145,6 +172,8 @@ pub struct ExclusionCache {
 }
 
 impl ExclusionCache {
+    /// Create a new empty exclusion cache
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -171,11 +200,11 @@ impl ExclusionCache {
 ///
 /// This resolves symlinks first, so editable installs (symlinks from
 /// `site-packages` into source directories) work correctly.
+#[must_use]
 pub fn is_excluded(path: &Path, config: &Config, cache: Option<&ExclusionCache>) -> bool {
     // Try to resolve symlinks
-    let resolved = match path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return true, // Treat unresolvable paths as excluded
+    let Ok(resolved) = path.canonicalize() else {
+        return true; // Treat unresolvable paths as excluded
     };
 
     // Check cache
@@ -199,29 +228,6 @@ pub fn is_excluded(path: &Path, config: &Config, cache: Option<&ExclusionCache>)
     excluded
 }
 
-/// Check if a path has a clear path to an ancestor (no exclusion boundaries between them)
-fn has_clear_path(source: &Path, ancestor: &Path, config: &Config) -> bool {
-    let mut current = source.parent();
-
-    while let Some(dir) = current {
-        // Stop when we reach the ancestor
-        if dir == ancestor {
-            return true;
-        }
-
-        // Check if this directory is an exclusion boundary
-        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-            if config.matches_exclusion(name) {
-                return false;
-            }
-        }
-
-        current = dir.parent();
-    }
-
-    false
-}
-
 /// Find the innermost marker directory for a source file
 fn find_marker_root(source: &Path, config: &Config) -> Option<PathBuf> {
     let mut current = source.parent()?;
@@ -235,11 +241,8 @@ fn find_marker_root(source: &Path, config: &Config) -> Option<PathBuf> {
         }
 
         // Check for any project marker in this directory
-        for marker in &config.markers {
-            let marker_path = current.join(marker);
-            if marker_path.exists() {
-                return Some(current.to_path_buf());
-            }
+        if config.marker_exists_in(current) {
+            return Some(current.to_path_buf());
         }
 
         // Move to parent
@@ -257,9 +260,8 @@ fn compute_lca<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf>
     let mut common_ancestors: Option<HashSet<PathBuf>> = None;
 
     for path in paths {
-        let resolved = match path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => continue,
+        let Ok(resolved) = path.canonicalize() else {
+            continue;
         };
 
         // Collect all ancestors of this path
@@ -298,7 +300,7 @@ fn compute_lca<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf>
 /// # Returns
 ///
 /// * `Some(path)` - The project root directory
-/// * `None` - If the file is excluded (in a virtual env, node_modules, etc.)
+/// * `None` - If the file is excluded (in a virtual env, `node_modules`, etc.)
 ///
 /// # Algorithm
 ///
@@ -306,18 +308,20 @@ fn compute_lca<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf>
 /// 2. If a marker directory is found → innermost marker directory
 /// 3. If dependency cluster provided → LCA of the cluster
 /// 4. Otherwise → parent directory (isolated orphan)
-pub fn find_root(
+#[must_use]
+pub fn find_root<S: BuildHasher>(
     source_file: &Path,
-    dependency_cluster: Option<&HashSet<PathBuf>>,
+    dependency_cluster: Option<&HashSet<PathBuf, S>>,
     config: &Config,
 ) -> Option<PathBuf> {
     find_root_with_cache(source_file, dependency_cluster, config, None)
 }
 
 /// Find the project root with an optional exclusion cache for better performance.
-pub fn find_root_with_cache(
+#[must_use]
+pub fn find_root_with_cache<S: BuildHasher>(
     source_file: &Path,
-    dependency_cluster: Option<&HashSet<PathBuf>>,
+    dependency_cluster: Option<&HashSet<PathBuf, S>>,
     config: &Config,
     cache: Option<&ExclusionCache>,
 ) -> Option<PathBuf> {
@@ -336,7 +340,7 @@ pub fn find_root_with_cache(
         let valid_files: Vec<&Path> = cluster
             .iter()
             .filter(|f| !is_excluded(f, config, cache))
-            .map(|p| p.as_path())
+            .map(PathBuf::as_path)
             .collect();
 
         if valid_files.len() > 1 {
@@ -357,6 +361,7 @@ pub fn find_root_with_cache(
 }
 
 /// Batch process multiple source files efficiently using a shared cache.
+#[must_use]
 pub fn find_roots_batch<'a>(
     source_files: impl IntoIterator<Item = &'a Path>,
     config: &Config,
@@ -365,7 +370,17 @@ pub fn find_roots_batch<'a>(
 
     source_files
         .into_iter()
-        .map(|path| (path, find_root_with_cache(path, None, config, Some(&cache))))
+        .map(|path| {
+            (
+                path,
+                find_root_with_cache::<std::collections::hash_map::RandomState>(
+                    path,
+                    None,
+                    config,
+                    Some(&cache),
+                ),
+            )
+        })
         .collect()
 }
 
@@ -405,7 +420,7 @@ mod tests {
         let config = Config::default();
         let source = temp.path().join("src/main.rs");
 
-        let root = find_root(&source, None, &config);
+        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
         assert_eq!(root, Some(temp.path().to_path_buf()));
     }
 
@@ -421,7 +436,7 @@ mod tests {
         let config = Config::default();
         let source = temp.path().join("packages/api/src/index.ts");
 
-        let root = find_root(&source, None, &config);
+        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
         assert_eq!(root, Some(temp.path().join("packages/api")));
     }
 
@@ -433,9 +448,11 @@ mod tests {
         ]);
 
         let config = Config::default();
-        let source = temp.path().join(".venv/lib/python3.11/site-packages/flask/app.py");
+        let source = temp
+            .path()
+            .join(".venv/lib/python3.11/site-packages/flask/app.py");
 
-        let root = find_root(&source, None, &config);
+        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
         assert_eq!(root, None);
     }
 
@@ -451,11 +468,17 @@ mod tests {
 
         // File in node_modules should be excluded
         let excluded_source = temp.path().join("node_modules/lodash/index.js");
-        assert_eq!(find_root(&excluded_source, None, &config), None);
+        assert_eq!(
+            find_root(&excluded_source, None::<&HashSet<PathBuf>>, &config),
+            None
+        );
 
         // File in src should find the project root
         let valid_source = temp.path().join("src/app.js");
-        assert_eq!(find_root(&valid_source, None, &config), Some(temp.path().to_path_buf()));
+        assert_eq!(
+            find_root(&valid_source, None::<&HashSet<PathBuf>>, &config),
+            Some(temp.path().to_path_buf())
+        );
     }
 
     #[test]
@@ -465,7 +488,7 @@ mod tests {
         let config = Config::default();
         let source = temp.path().join("scripts/test.py");
 
-        let root = find_root(&source, None, &config);
+        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
         assert_eq!(root, Some(temp.path().join("scripts")));
     }
 
@@ -504,7 +527,7 @@ mod tests {
 
         // The package.json inside node_modules should not be found
         let source = temp.path().join("node_modules/some-pkg/index.js");
-        assert_eq!(find_root(&source, None, &config), None);
+        assert_eq!(find_root(&source, None::<&HashSet<PathBuf>>, &config), None);
     }
 
     #[test]
@@ -519,7 +542,7 @@ mod tests {
         let source = temp.path().join("src/main.cc");
 
         // Should find src/ because BUILD is there (innermost)
-        let root = find_root(&source, None, &config);
+        let root = find_root(&source, None::<&HashSet<PathBuf>>, &config);
         assert_eq!(root, Some(temp.path().join("src")));
     }
 
@@ -539,7 +562,7 @@ mod tests {
             temp.path().join("node_modules/pkg/c.js"),
         ];
 
-        let results = find_roots_batch(files.iter().map(|p| p.as_path()), &config);
+        let results = find_roots_batch(files.iter().map(PathBuf::as_path), &config);
 
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].1, Some(temp.path().to_path_buf()));

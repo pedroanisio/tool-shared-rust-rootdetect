@@ -15,6 +15,25 @@ A Rust implementation of the [Project Root Detection Specification](https://exam
 ## Installation
 
 ```bash
+
+# Project Root Detector
+
+Detect project root directories from source file paths, supporting monorepos, virtual environments, and a wide range of project types. Implements the [Project Root Detection Specification](https://example.com/spec) in Rust, with a CLI and library API.
+
+## Features
+
+- **Exclusion zones**: Skips virtual environments, `node_modules`, build artifacts, and caches
+- **Marker detection**: Finds project roots via `.git`, `Cargo.toml`, `package.json`, and more
+- **Innermost wins**: Returns the closest marker to the source file (monorepo support)
+- **Symlink-aware**: Resolves symlinks before checking exclusions (editable installs work)
+- **Dependency clustering**: Supports LCA computation for orphan file clusters
+- **Thread-safe caching**: Efficient batch processing with shared exclusion cache
+- **Cross-platform**: Case-insensitive matching on Windows/macOS
+- **CLI and library**: Use as a command-line tool or as a Rust crate
+
+## Installation
+
+```bash
 cargo add project-root-detector
 ```
 
@@ -25,21 +44,55 @@ Or add to your `Cargo.toml`:
 project-root-detector = "0.1"
 ```
 
-## Quick Start
+## Library Usage
 
 ```rust
 use project_root_detector::{find_root, Config};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+let config = Config::default();
+let source = Path::new("/home/user/my_project/src/main.rs");
+
+if let Some(root) = find_root(source, None::<&HashSet<PathBuf>>, &config) {
+    println!("Project root: {}", root.display());
+}
+```
+
+### Batch Processing
+
+```rust
+use project_root_detector::{find_roots_batch, Config};
 use std::path::Path;
 
-fn main() {
-    let config = Config::default();
-    let source = Path::new("/home/user/my_project/src/main.rs");
-    
-    match find_root(source, None, &config) {
-        Some(root) => println!("Project root: {}", root.display()),
-        None => println!("File is excluded (in venv, node_modules, etc.)"),
-    }
+let config = Config::default();
+let files = vec![
+    Path::new("src/main.rs"),
+    Path::new("src/lib.rs"),
+    Path::new("tests/integration.rs"),
+];
+
+let results = find_roots_batch(files.into_iter(), &config);
+for (file, root) in results {
+    println!("{} -> {:?}", file.display(), root);
 }
+```
+
+### Custom Configuration
+
+```rust
+use project_root_detector::Config;
+
+// Custom configuration
+let config = Config::new(
+    &[".venv", "node_modules"],  // exclusions
+    &[".git", "Cargo.toml"],     // markers
+);
+
+// Or extend defaults
+let config = Config::default()
+    .with_exclusions(&[".myenv", "deps"])
+    .with_markers(&["WORKSPACE", "BUILD.bazel"]);
 ```
 
 ## CLI Usage
@@ -58,6 +111,40 @@ find . -name '*.rs' | project-root-detector --batch
 project-root-detector --json src/main.rs
 
 # Exit with error if any file is excluded
+project-root-detector --check node_modules/pkg/index.js
+```
+
+### CLI Options
+
+- `--batch` — Read file paths from stdin (one per line)
+- `--check` — Exit with code 1 if any file is excluded
+- `--json` — Output results as JSON
+- `FILE...` — Source files to analyze
+
+## Algorithm
+
+The algorithm follows these cases in order:
+
+| Case | Condition | Result |
+|------|-----------|--------|
+| 1 | File in exclusion zone | `None` (excluded) |
+| 2 | Marker directory found | Innermost marker directory |
+| 3 | Dependency cluster provided | LCA of the cluster |
+| 4 | Isolated orphan | Parent directory |
+
+#### Default Exclusions
+
+```
+.venv, venv, node_modules, __pycache__, site-packages,
+.tox, dist, build, .egg-info, .mypy_cache, .pytest_cache,
+.ruff_cache, target, vendor, .gradle
+```
+
+#### Default Markers
+
+```
+.git, .hg, pyproject.toml, setup.py, package.json,
+Cargo.toml, go.mod, pom.xml, build.gradle, CMakeLists.txt,
 project-root-detector --check node_modules/pkg/index.js
 ```
 
