@@ -261,10 +261,49 @@ fn find_marker_root(source: &Path, config: &Config) -> Option<PathBuf> {
 
 /// Find the "orphanage" for an orphan file (no marker found).
 ///
-/// Per spec: `orphanage(s) = min⊴(SourceDirs ∩ ancestors(s))`
+/// The sibling-aware orphanage rule:
+/// "Walk up until we find a level with no sibling SourceDirs AND the parent itself
+/// is not a SourceDir, then return that level."
 ///
-/// This finds the **outermost** ancestor directory that contains source files.
-/// If no such directory exists in ancestry, falls back to the file's parent.
+/// This groups related files under a common parent when:
+/// 1. Multiple sibling branches contain source files, OR
+/// 2. An ancestor directory directly contains source files
+///
+/// # Algorithm
+///
+/// ```text
+/// flask-domain-management-api/    ← empty (no source files directly here)
+/// ├── app/                        ← SourceDir
+/// │   └── models/user.py
+/// ├── migrations/                 ← SourceDir
+/// └── tests/                      ← SourceDir
+///
+/// For user.py:
+/// 1. candidate = models/ (parent of file)
+/// 2. parent = app/ → siblings with sources? No, parent is SourceDir? No → WAIT
+///    But app/ has siblings with sources at flask.../ level
+/// 3. parent = flask.../ → siblings with sources? YES (migrations/, tests/)
+///    → candidate = flask.../
+/// 4. parent of flask.../ → siblings with sources? No, parent is SourceDir? No
+///    → STOP. Orphanage = flask.../
+/// ```
+///
+/// For api-web2text example:
+/// ```text
+/// api-web2text/           ← SourceDir (has main.py)
+/// └── app/api/model/      ← SourceDir (has user.py)
+///     └── user.py
+///
+/// For user.py:
+/// 1. candidate = model/
+/// 2. parent = api/ → Is api-web2text/ (ancestor) a SourceDir? YES
+///    → candidate = api/
+/// 3. parent = app/ → Is api-web2text/ (ancestor) a SourceDir? YES
+///    → candidate = app/
+/// 4. parent = api-web2text/ → Is SourceDir? YES → candidate = api-web2text/
+/// 5. parent of api-web2text/ → siblings? ancestor SourceDir? Check...
+///    → If no, STOP. Orphanage = api-web2text/
+/// ```
 ///
 /// # Arguments
 ///
@@ -273,34 +312,87 @@ fn find_marker_root(source: &Path, config: &Config) -> Option<PathBuf> {
 ///
 /// # Returns
 ///
-/// The outermost `SourceDir` in the file's ancestry, or `parent(source)` as fallback.
+/// The appropriate orphanage directory for this file.
 fn find_orphanage<S: BuildHasher>(source: &Path, source_dirs: &HashSet<PathBuf, S>) -> PathBuf {
-    let parent = source.parent().unwrap_or(source);
-
-    // Collect ancestors that are also SourceDirs
-    let mut ancestor_source_dirs: Vec<&Path> = Vec::new();
-    let mut current = parent;
+    let mut candidate = source.parent().unwrap_or(source).to_path_buf();
 
     loop {
-        // Check if this ancestor is a SourceDir
-        if source_dirs.contains(current) {
-            ancestor_source_dirs.push(current);
+        let Some(parent) = candidate.parent() else {
+            // Reached filesystem root
+            return candidate;
+        };
+
+        if parent == candidate {
+            // At root (e.g., "/" or "C:\")
+            return candidate;
         }
 
-        // Move to parent
+        // Check if we should go up:
+        // 1. Parent has sibling directories with sources, OR
+        // 2. Parent (or any ancestor of parent) is a SourceDir
+        let has_sibling_sources = has_sibling_source_dirs(&candidate, parent, source_dirs);
+        let parent_or_ancestor_is_source_dir = is_or_has_ancestor_source_dir(parent, source_dirs);
+
+        if has_sibling_sources || parent_or_ancestor_is_source_dir {
+            // Go up to parent
+            candidate = parent.to_path_buf();
+        } else {
+            // No more sources above → this is the orphanage
+            return candidate;
+        }
+    }
+}
+
+/// Check if a path is a SourceDir or has an ancestor that is a SourceDir.
+fn is_or_has_ancestor_source_dir<S: BuildHasher>(
+    path: &Path,
+    source_dirs: &HashSet<PathBuf, S>,
+) -> bool {
+    let mut current = path;
+    loop {
+        if source_dirs.contains(current) {
+            return true;
+        }
         match current.parent() {
             Some(p) if p != current => current = p,
-            _ => break,
+            _ => return false,
+        }
+    }
+}
+
+/// Check if a directory has sibling directories that are or contain SourceDirs.
+fn has_sibling_source_dirs<S: BuildHasher>(
+    current: &Path,
+    parent: &Path,
+    source_dirs: &HashSet<PathBuf, S>,
+) -> bool {
+    // Read parent directory to find siblings
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let sibling = entry.path();
+
+        // Skip if it's not a directory or if it's the current path
+        if !sibling.is_dir() || sibling == current {
+            continue;
+        }
+
+        // Check if this sibling is a SourceDir or contains any SourceDirs
+        if source_dirs.contains(&sibling) {
+            return true;
+        }
+
+        // Check if any SourceDir is under this sibling
+        for sd in source_dirs.iter() {
+            if sd.starts_with(&sibling) {
+                return true;
+            }
         }
     }
 
-    if ancestor_source_dirs.is_empty() {
-        // No SourceDirs in ancestry - fall back to parent (Case 5 scenario)
-        parent.to_path_buf()
-    } else {
-        // Return the outermost (last in our traversal, closest to root)
-        ancestor_source_dirs.last().unwrap().to_path_buf()
-    }
+    false
 }
 
 /// Compute the Lowest Common Ancestor of a set of paths
@@ -837,6 +929,61 @@ mod tests {
         // SourceDirs = {scripts/}, ancestors ∩ SourceDirs = {scripts/}
         // Outermost = scripts/
         assert_eq!(results[0].1, Some(temp.path().join("scripts")));
+    }
+
+    #[test]
+    fn test_orphanage_sibling_aware() {
+        // The flask-domain-management-api example:
+        // Multiple sibling directories with sources should group under empty parent
+        let temp = setup_project(&[
+            ("flask-api/app/models/user.py", false), // SourceDir: app/models/
+            ("flask-api/app/routes/api.py", false),  // SourceDir: app/routes/
+            ("flask-api/migrations/init.py", false), // SourceDir: migrations/
+            ("flask-api/tests/test_app.py", false),  // SourceDir: tests/
+        ]);
+
+        let config = Config::default();
+
+        let files = vec![
+            temp.path().join("flask-api/app/models/user.py"),
+            temp.path().join("flask-api/app/routes/api.py"),
+            temp.path().join("flask-api/migrations/init.py"),
+            temp.path().join("flask-api/tests/test_app.py"),
+        ];
+
+        let results = find_roots_batch(files.iter().map(PathBuf::as_path), &config);
+
+        // All files should share flask-api/ as orphanage
+        // because app/, migrations/, tests/ are siblings with sources
+        let roots: Vec<_> = results.iter().map(|(_, r)| r.clone()).collect();
+        assert_eq!(roots[0], Some(temp.path().join("flask-api")));
+        assert_eq!(roots[1], Some(temp.path().join("flask-api")));
+        assert_eq!(roots[2], Some(temp.path().join("flask-api")));
+        assert_eq!(roots[3], Some(temp.path().join("flask-api")));
+    }
+
+    #[test]
+    fn test_orphanage_single_branch_stays_deep() {
+        // If only one branch has sources, stay at that level
+        let temp = setup_project(&[
+            ("project/app/models/user.py", false), // Only app branch has sources
+            ("project/app/routes/api.py", false),
+        ]);
+
+        let config = Config::default();
+
+        let files = vec![
+            temp.path().join("project/app/models/user.py"),
+            temp.path().join("project/app/routes/api.py"),
+        ];
+
+        let results = find_roots_batch(files.iter().map(PathBuf::as_path), &config);
+
+        // models/ and routes/ are siblings → go up to app/
+        // app/ has no sibling with sources → stop at app/
+        let roots: Vec<_> = results.iter().map(|(_, r)| r.clone()).collect();
+        assert_eq!(roots[0], Some(temp.path().join("project/app")));
+        assert_eq!(roots[1], Some(temp.path().join("project/app")));
     }
 
     #[test]
